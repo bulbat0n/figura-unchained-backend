@@ -1,0 +1,15 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "127.0.0.1:${PORT}:${PORT}"
+    volumes:
+      - backend_data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+
+volumes:
+  backend_data:

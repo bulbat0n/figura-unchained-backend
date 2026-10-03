@@ -1,0 +1,31 @@
+# ========================
+# Python Environment
+# ========================
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ========================
+# IDE artifacts
+# ========================
+.idea/
+.vscode/
+
+# ========================
+# Runtime and Local Files
+# ========================
+.env
+data/
+*.log
+.admin_session
+.admin_command*.json
+.admin_command*.tmp
+
+# ========================
+# Operating System files
+# ========================
+.DS_Store
+Thumbs.db
