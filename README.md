@@ -1,3 +1,5 @@
+[![Modrinth](https://img.shields.io/badge/Modrinth-figura--unchained-%2300AF5C?style=flat-square&logo=modrinth&logoColor=white)](https://modrinth.com/mod/figura-unchained)
+
 ## This is the backend repository for Figura Unchained. 
 **Looking for the addon?** Get the mod on [Modrinth](https://modrinth.com/mod/figura-unchained) or view the [Addon Source Code](https://github.com/bulbat0n/figura-unchained).
 
