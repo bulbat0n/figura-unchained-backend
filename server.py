@@ -7,6 +7,7 @@ import time
 import secrets
 import atexit
 import sqlite3
+import threading
 import bcrypt
 import jwt
 import ipaddress
@@ -26,7 +27,8 @@ REQUIRED_VARS = [
     "MAX_PING_SIZE", "MAX_AVATAR_SIZE", "REQUIRE_AUTH",
     "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW", "TRUSTED_PROXIES",
     "RATE_LIMIT_CLEANUP_INTERVAL", "WS_MAX_CONNECTIONS_PER_IP",
-    "WS_MAX_MESSAGES_PER_SEC", "WS_MAX_SUBS_PER_CLIENT"
+    "WS_MAX_MESSAGES_PER_SEC", "WS_MAX_SUBS_PER_CLIENT",
+    "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW"
 ]
 
 missing_vars = [var for var in REQUIRED_VARS if not os.environ.get(var)]
@@ -65,6 +67,8 @@ try:
     WS_MAX_CONNECTIONS_PER_IP = int(os.environ.get("WS_MAX_CONNECTIONS_PER_IP"))
     WS_MAX_MESSAGES_PER_SEC = int(os.environ.get("WS_MAX_MESSAGES_PER_SEC"))
     WS_MAX_SUBS_PER_CLIENT = int(os.environ.get("WS_MAX_SUBS_PER_CLIENT"))
+    LOGIN_RATE_LIMIT_REQUESTS = int(os.environ.get("LOGIN_RATE_LIMIT_REQUESTS"))
+    LOGIN_RATE_LIMIT_WINDOW = int(os.environ.get("LOGIN_RATE_LIMIT_WINDOW"))
 except ValueError:
     config_errors.append("Limits and intervals must be integers.")
 
@@ -113,6 +117,7 @@ def save_secure_file(path, content):
 db_conn = sqlite3.connect('data/users.db', check_same_thread=False)
 db_conn.execute('CREATE TABLE IF NOT EXISTS users (uuid TEXT PRIMARY KEY, password_hash TEXT, last_ip TEXT)')
 db_conn.commit()
+db_lock = threading.Lock()
 
 ADMIN_SESSION_TOKEN = secrets.token_hex(32)
 save_secure_file("data/.admin_session", ADMIN_SESSION_TOKEN)
@@ -154,29 +159,33 @@ def get_file_hash_sync(filepath):
     return hasher.hexdigest()
 
 def db_is_registered_sync(client_uuid):
-    cursor = db_conn.cursor()
-    cursor.execute("SELECT 1 FROM users WHERE uuid = ?", (client_uuid,))
-    return cursor.fetchone() is not None
+    with db_lock:
+        cursor = db_conn.cursor()
+        cursor.execute("SELECT 1 FROM users WHERE uuid = ?", (client_uuid,))
+        return cursor.fetchone() is not None
 
 def db_register_sync(client_uuid, client_hash, real_ip):
-    cursor = db_conn.cursor()
-    cursor.execute("SELECT uuid FROM users WHERE uuid = ?", (client_uuid,))
-    if cursor.fetchone():
+    if db_is_registered_sync(client_uuid):
         return False
     hashed_pw = bcrypt.hashpw(client_hash.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    cursor.execute("INSERT INTO users (uuid, password_hash, last_ip) VALUES (?, ?, ?)", (client_uuid, hashed_pw, real_ip))
-    db_conn.commit()
+    with db_lock:
+        try:
+            db_conn.execute("INSERT INTO users (uuid, password_hash, last_ip) VALUES (?, ?, ?)", (client_uuid, hashed_pw, real_ip))
+            db_conn.commit()
+        except sqlite3.IntegrityError:
+            db_conn.rollback()
+            return False
     return True
 
 def db_login_sync(client_uuid, client_hash, real_ip):
-    cursor = db_conn.cursor()
-    cursor.execute("SELECT password_hash FROM users WHERE uuid = ?", (client_uuid,))
-    row = cursor.fetchone()
+    with db_lock:
+        row = db_conn.execute("SELECT password_hash FROM users WHERE uuid = ?", (client_uuid,)).fetchone()
     if not row:
         return False
     if bcrypt.checkpw(client_hash.encode('utf-8'), row[0].encode('utf-8')):
-        cursor.execute("UPDATE users SET last_ip = ? WHERE uuid = ?", (real_ip, client_uuid))
-        db_conn.commit()
+        with db_lock:
+            db_conn.execute("UPDATE users SET last_ip = ? WHERE uuid = ?", (real_ip, client_uuid))
+            db_conn.commit()
         return True
     return False
 
@@ -227,6 +236,8 @@ users_with_avatars = set()
 rate_limits = {}
 hash_cache = {}
 ip_connections = {}
+auth_rate_limits = {}
+AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
 
 @web.middleware
 async def security_middleware(request, handler):
@@ -245,11 +256,34 @@ async def security_middleware(request, handler):
             log_debug(f"[HTTP] Rate limit exceeded for {real_ip}")
             return web.json_response({"error": "Too Many Requests"}, status=429)
 
+    if LOGIN_RATE_LIMIT_REQUESTS > 0 and request.method == "POST" and request.path in AUTH_PATHS:
+        entry = auth_rate_limits.get(real_ip)
+        if entry is None or current_time > entry["reset"]:
+            entry = auth_rate_limits[real_ip] = {"count": 0, "reset": current_time + LOGIN_RATE_LIMIT_WINDOW}
+        entry["count"] += 1
+        if entry["count"] > LOGIN_RATE_LIMIT_REQUESTS:
+            return web.json_response({"error": "Too Many Requests"}, status=429)
+
     ignore_logs = ['/api/version', '/api/limits', '/api/motd', '/api/', '/api', '/api/auth/register', '/api/auth/login']
     if request.path not in ignore_logs:
         log_debug(f"[HTTP] {request.method} {request.path} | IP: {real_ip}")
         
     return await handler(request)
+
+async def read_auth_body(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return None, None
+    if not isinstance(body, dict):
+        return None, None
+    client_uuid = body.get("uuid")
+    client_hash = body.get("hash")
+    if not isinstance(client_uuid, str) or not isinstance(client_hash, str):
+        return None, None
+    if not is_valid_uuid(client_uuid) or not client_hash or len(client_hash.encode('utf-8')) > 72:
+        return None, None
+    return client_uuid, client_hash
 
 async def handle_api_check(request):
     return web.json_response({"status": "ok"})
@@ -264,11 +298,8 @@ async def handle_motd(request):
     return web.json_response({"text": "Figura Unchained Backend", "color": "gold"})
 
 async def handle_register(request):
-    body = await request.json()
-    client_uuid = body.get("uuid")
-    client_hash = body.get("hash")
-    
-    if not is_valid_uuid(client_uuid) or not client_hash:
+    client_uuid, client_hash = await read_auth_body(request)
+    if client_uuid is None:
         return web.json_response({"error": "Invalid data format"}, status=400)
         
     success = await asyncio.to_thread(db_register_sync, client_uuid, client_hash, request['real_ip'])
@@ -285,11 +316,8 @@ async def handle_register(request):
     })
 
 async def handle_login(request):
-    body = await request.json()
-    client_uuid = body.get("uuid")
-    client_hash = body.get("hash")
-    
-    if not is_valid_uuid(client_uuid) or not client_hash:
+    client_uuid, client_hash = await read_auth_body(request)
+    if client_uuid is None:
         return web.json_response({"error": "Invalid data format"}, status=400)
         
     success = await asyncio.to_thread(db_login_sync, client_uuid, client_hash, request['real_ip'])
@@ -462,6 +490,8 @@ async def websocket_handler(request):
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     data = msg.data
+                    if not data:
+                        continue
                     cmd = data[0]
                     
                     current_time = time.time()
@@ -560,6 +590,8 @@ async def cleanup_rate_limits(app):
         expired = [ip for ip, data in rate_limits.items() if now > data["reset"]]
         for ip in expired:
             del rate_limits[ip]
+        for ip in [ip for ip, d in auth_rate_limits.items() if now > d["reset"]]:
+            del auth_rate_limits[ip]
 
 def process_admin_commands():
     commands = []
