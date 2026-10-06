@@ -15,6 +15,7 @@ import asyncio
 import logging
 import json
 import glob
+import zlib
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from aiohttp import web, WSMsgType
@@ -28,7 +29,8 @@ REQUIRED_VARS = [
     "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW", "TRUSTED_PROXIES",
     "RATE_LIMIT_CLEANUP_INTERVAL", "WS_MAX_CONNECTIONS_PER_IP",
     "WS_MAX_MESSAGES_PER_SEC", "WS_MAX_SUBS_PER_CLIENT",
-    "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW"
+    "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW",
+    "MAX_AVATAR_UNPACKED_SIZE"
 ]
 
 missing_vars = [var for var in REQUIRED_VARS if not os.environ.get(var)]
@@ -69,6 +71,9 @@ try:
     WS_MAX_SUBS_PER_CLIENT = int(os.environ.get("WS_MAX_SUBS_PER_CLIENT"))
     LOGIN_RATE_LIMIT_REQUESTS = int(os.environ.get("LOGIN_RATE_LIMIT_REQUESTS"))
     LOGIN_RATE_LIMIT_WINDOW = int(os.environ.get("LOGIN_RATE_LIMIT_WINDOW"))
+    MAX_AVATAR_UNPACKED_SIZE = int(os.environ.get("MAX_AVATAR_UNPACKED_SIZE"))
+    if MAX_AVATAR_UNPACKED_SIZE < MAX_AVATAR_SIZE:
+        config_errors.append("MAX_AVATAR_UNPACKED_SIZE must not be smaller than MAX_AVATAR_SIZE.")
 except ValueError:
     config_errors.append("Limits and intervals must be integers.")
 
@@ -350,6 +355,37 @@ async def download_avatar(request):
         return web.FileResponse(file_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     return web.json_response({"error": "Not found"}, status=404, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
+class GzipValidator:
+    def __init__(self, limit):
+        self.limit = limit
+        self.total = 0
+        self.decomp = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        self.members = 0
+
+    def feed(self, data):
+        buf = data
+        while buf:
+            if self.decomp.eof:
+                self.decomp = zlib.decompressobj(zlib.MAX_WBITS | 16)
+            out = self.decomp.decompress(buf, 262144)
+            self.total += len(out)
+            if self.total > self.limit:
+                return False
+            if self.decomp.eof:
+                self.members += 1
+                buf = self.decomp.unused_data
+            else:
+                buf = self.decomp.unconsumed_tail
+        return True
+
+    def complete(self):
+        return self.decomp.eof and self.members > 0 and self.total > 0
+
+async def iter_upload_body(first_chunk, content):
+    yield first_chunk
+    async for chunk in content.iter_chunked(65536):
+        yield chunk
+
 async def upload_avatar(request):
     raw_token = request.headers.get('token', '')
     client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
@@ -380,17 +416,40 @@ async def upload_avatar(request):
     if len(first_chunk_data) > MAX_AVATAR_SIZE:
         return web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
     
-    bytes_written = len(first_chunk_data)
-    with open(file_path, 'wb') as f:
-        await loop.run_in_executor(None, f.write, first_chunk_data)
-        
-        async for chunk in request.content.iter_chunked(65536):
-            bytes_written += len(chunk)
-            if bytes_written > MAX_AVATAR_SIZE:
-                os.remove(file_path)
-                return web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
-            await loop.run_in_executor(None, f.write, chunk)
-            
+    tmp_path = f"{file_path}.{secrets.token_hex(6)}.tmp"
+    validator = GzipValidator(MAX_AVATAR_UNPACKED_SIZE)
+    bytes_written = 0
+    error = None
+
+    try:
+        with open(tmp_path, 'wb') as f:
+            async for chunk in iter_upload_body(first_chunk_data, request.content):
+                bytes_written += len(chunk)
+                if bytes_written > MAX_AVATAR_SIZE:
+                    error = web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
+                    break
+                try:
+                    within_limit = await loop.run_in_executor(None, validator.feed, chunk)
+                except zlib.error:
+                    error = web.json_response({"error": "Invalid format. Only compressed NBT allowed."}, status=400)
+                    break
+                if not within_limit:
+                    log_info(f"[UPLOAD] UUID {client_uuid[:8]} rejected: unpacked size over limit.")
+                    error = web.json_response({"error": "File exceeds MAX_AVATAR_UNPACKED_SIZE"}, status=413)
+                    break
+                await loop.run_in_executor(None, f.write, chunk)
+
+        if error is None and not validator.complete():
+            error = web.json_response({"error": "Invalid format. Only compressed NBT allowed."}, status=400)
+
+        if error is not None:
+            return error
+
+        os.replace(tmp_path, file_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     hash_cache[client_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
     users_with_avatars.add(client_uuid)
     log_info(f"[UPLOAD] UUID {client_uuid[:8]} saved skin ({bytes_written} bytes).")
