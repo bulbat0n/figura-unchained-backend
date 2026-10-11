@@ -184,6 +184,9 @@ def shown(value, limit=40):
     text = str(value)
     return repr(text) if len(text) <= limit else f"<{len(text)} chars>"
 
+def short_uuid(value):
+    return str(value).split('-')[0]
+
 def fmt_dur(seconds):
     seconds = int(seconds)
     hours, rest = divmod(seconds, 3600)
@@ -704,14 +707,14 @@ async def websocket_handler(request):
                         uuid_bytes = uuid.UUID(client_uuid).bytes
                         s2c_packet = data[0:1] + uuid_bytes + data[1:]
                         
-                        recipients = 0
+                        recipients = []
                         if client_uuid in subscriptions:
                             for sub_uuid in subscriptions[client_uuid]:
                                 if sub_uuid != client_uuid and sub_uuid in active_connections:
                                     await active_connections[sub_uuid].send_bytes(s2c_packet)
-                                    recipients += 1
+                                    recipients.append(short_uuid(sub_uuid))
                         pings_relayed += 1
-                        log_debug(f"[WS-PING] uuid={client_uuid} size={len(data)} -> {recipients} recipient(s)")
+                        log_debug(f"[WS-PING] {short_uuid(client_uuid)} size={len(data)} -> {', '.join(recipients) if recipients else 'nobody'}")
                     
                     elif cmd == 2 and len(data) >= 17:
                         if client_subs >= WS_MAX_SUBS_PER_CLIENT:
@@ -723,7 +726,7 @@ async def websocket_handler(request):
                         if client_uuid not in subscriptions[target_uuid]:
                             subscriptions[target_uuid].add(client_uuid)
                             client_subs += 1
-                        log_debug(f"[WS-SUB] {client_uuid} -> {target_uuid}")
+                        log_debug(f"[WS-SUB] {short_uuid(client_uuid)} -> {short_uuid(target_uuid)}")
                         
                         uuid_bytes = uuid.UUID(target_uuid).bytes
                         event_packet = b'\x02' + uuid_bytes
@@ -734,7 +737,7 @@ async def websocket_handler(request):
                         if target_uuid in subscriptions and client_uuid in subscriptions[target_uuid]:
                             subscriptions[target_uuid].remove(client_uuid)
                             client_subs -= 1
-                            log_debug(f"[WS-UNSUB] {client_uuid} -/-> {target_uuid}")
+                            log_debug(f"[WS-UNSUB] {short_uuid(client_uuid)} -/-> {short_uuid(target_uuid)}")
                     
                 elif msg.type == WSMsgType.ERROR:
                     log_warn(f"[WS] error uuid={fmt_uuid(client_uuid)} ip={real_ip}: {ws.exception()!r}")
@@ -745,19 +748,20 @@ async def websocket_handler(request):
         finally:
             current = active_connections.get(client_uuid)
             replaced = current is not None and current is not ws
-            if client_uuid in active_connections:
+            if current is ws:
                 del active_connections[client_uuid]
             
-            for target in list(subscriptions.keys()):
-                if client_uuid in subscriptions[target]:
-                    subscriptions[target].remove(client_uuid)
-                    if not subscriptions[target]:
-                        del subscriptions[target]
+            if not replaced:
+                for target in list(subscriptions.keys()):
+                    if client_uuid in subscriptions[target]:
+                        subscriptions[target].remove(client_uuid)
+                        if not subscriptions[target]:
+                            del subscriptions[target]
                         
             drops_text = ", ".join(f"{k}={v}" for k, v in drops.items()) or "none"
             log_info(f"[WS] - disconnect uuid={fmt_uuid(client_uuid)} ip={real_ip} time={fmt_dur(time.time() - connected_at)} code={ws.close_code} pings={pings_in} relayed={pings_relayed} drops={drops_text} subs={client_subs} online={len(active_connections)}")
             if replaced:
-                log_warn(f"[WS] uuid={fmt_uuid(client_uuid)}: this closed connection had been replaced by a newer one, and the registry entry of the newer session was removed too")
+                log_info(f"[WS] uuid={fmt_uuid(client_uuid)}: closed connection had already been replaced by a newer one; the newer session was left untouched")
     finally:
         ip_connections[real_ip] -= 1
         if ip_connections[real_ip] <= 0:
