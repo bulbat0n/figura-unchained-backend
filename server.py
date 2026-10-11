@@ -655,6 +655,11 @@ async def websocket_handler(request):
                 else:
                     toast_packet = b'\x03\x00' + "Authenticated".encode('utf-8') + b'\x00' + "Connected successfully.".encode('utf-8')
                     await ws.send_bytes(toast_packet)
+
+            # TEMPORARY: remove this whole block once old addon versions (they send v4 UUIDs) are no longer in use
+            if uuid.UUID(client_uuid).version == 4:
+                warn_packet = b'\x03\x01' + "Outdated version of Figura Unchained".encode('utf-8') + b'\x00' + "Please update your version on Modrinth".encode('utf-8')
+                await ws.send_bytes(warn_packet)
             
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
