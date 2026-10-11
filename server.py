@@ -103,7 +103,7 @@ os.makedirs("data", exist_ok=True)
 os.makedirs(AVATAR_DIR, exist_ok=True)
 
 log_level = logging.DEBUG if DEBUG else logging.INFO
-log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)-7s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 stdout_handler = logging.StreamHandler(sys.stdout)
 stdout_handler.setFormatter(log_formatter)
@@ -149,12 +149,50 @@ def is_valid_uuid(val):
 def log_info(msg):
     logging.info(msg)
 
+def log_warn(msg):
+    logging.warning(msg)
+
+def log_error(msg, exc_info=False):
+    logging.error(msg, exc_info=exc_info)
+
 def log_debug(msg):
     if DEBUG:
         logging.debug(msg)
 
-def hex_dump(data):
-    return data.hex().upper()
+throttle_state = {}
+
+def log_throttled(key, msg, interval=60):
+    now = time.time()
+    entry = throttle_state.get(key)
+    if entry and now - entry[0] < interval:
+        entry[1] += 1
+        return
+    suppressed = entry[1] if entry else 0
+    throttle_state[key] = [now, 0]
+    if suppressed:
+        msg += f" (+{suppressed} similar suppressed)"
+    logging.warning(msg)
+
+def fmt_uuid(value):
+    try:
+        version = uuid.UUID(value).version
+    except (ValueError, AttributeError, TypeError):
+        return shown(value)
+    return f"{value} (v{version if version else '?'})"
+
+def shown(value, limit=40):
+    text = str(value)
+    return repr(text) if len(text) <= limit else f"<{len(text)} chars>"
+
+def fmt_dur(seconds):
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 def get_file_hash_sync(filepath):
     hasher = hashlib.sha256()
@@ -194,9 +232,9 @@ def db_login_sync(client_uuid, client_hash, real_ip):
         return True
     return False
 
-def check_auth(request, client_uuid):
+def auth_status(request, client_uuid):
     if not REQUIRE_AUTH:
-        return True
+        return True, "auth-disabled"
     token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -205,13 +243,20 @@ def check_auth(request, client_uuid):
         raw_token = request.headers.get("token", "")
         if ":" in raw_token:
             token = raw_token.split(":", 1)[1]
-    if token:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            return payload.get("uuid") == client_uuid
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-            return False
-    return False
+    if not token:
+        return False, "no-token"
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return False, "token-expired"
+    except jwt.InvalidTokenError:
+        return False, "token-invalid"
+    if payload.get("uuid") != client_uuid:
+        return False, "token-uuid-mismatch"
+    return True, "ok"
+
+def check_auth(request, client_uuid):
+    return auth_status(request, client_uuid)[0]
 
 def get_real_ip(request):
     try:
@@ -243,6 +288,7 @@ hash_cache = {}
 ip_connections = {}
 auth_rate_limits = {}
 AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
+WS_PATHS = ('/ws', '/api/ws', '/api//ws')
 
 @web.middleware
 async def security_middleware(request, handler):
@@ -258,7 +304,7 @@ async def security_middleware(request, handler):
     else:
         rate_limits[real_ip]["count"] += 1
         if rate_limits[real_ip]["count"] > RATE_LIMIT_REQUESTS:
-            log_debug(f"[HTTP] Rate limit exceeded for {real_ip}")
+            log_throttled(f"rate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s (last: {request.method} {request.path!r})")
             return web.json_response({"error": "Too Many Requests"}, status=429)
 
     if LOGIN_RATE_LIMIT_REQUESTS > 0 and request.method == "POST" and request.path in AUTH_PATHS:
@@ -267,28 +313,41 @@ async def security_middleware(request, handler):
             entry = auth_rate_limits[real_ip] = {"count": 0, "reset": current_time + LOGIN_RATE_LIMIT_WINDOW}
         entry["count"] += 1
         if entry["count"] > LOGIN_RATE_LIMIT_REQUESTS:
+            log_throttled(f"authrate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {LOGIN_RATE_LIMIT_REQUESTS} auth attempts per {LOGIN_RATE_LIMIT_WINDOW}s ({request.path})")
             return web.json_response({"error": "Too Many Requests"}, status=429)
 
     ignore_logs = ['/api/version', '/api/limits', '/api/motd', '/api/', '/api', '/api/auth/register', '/api/auth/login']
     if request.path not in ignore_logs:
-        log_debug(f"[HTTP] {request.method} {request.path} | IP: {real_ip}")
-        
-    return await handler(request)
+        log_debug(f"[HTTP] {request.method} {request.path!r} ip={real_ip}")
+
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception:
+        logging.exception(f"[HTTP] Unhandled error in {request.method} {request.path!r} ip={real_ip}")
+        if request.path in WS_PATHS:
+            raise
+        raise web.HTTPInternalServerError()
 
 async def read_auth_body(request):
     try:
         body = await request.json()
     except Exception:
-        return None, None
+        return None, None, "body-is-not-json"
     if not isinstance(body, dict):
-        return None, None
+        return None, None, "body-is-not-an-object"
     client_uuid = body.get("uuid")
     client_hash = body.get("hash")
     if not isinstance(client_uuid, str) or not isinstance(client_hash, str):
-        return None, None
-    if not is_valid_uuid(client_uuid) or not client_hash or len(client_hash.encode('utf-8')) > 72:
-        return None, None
-    return client_uuid, client_hash
+        return None, None, "uuid-or-hash-missing"
+    if not is_valid_uuid(client_uuid):
+        return None, None, f"invalid-uuid-format {shown(client_uuid)}"
+    if not client_hash:
+        return None, None, "empty-hash"
+    if len(client_hash.encode('utf-8')) > 72:
+        return None, None, "hash-too-long"
+    return client_uuid, client_hash, None
 
 async def handle_api_check(request):
     return web.json_response({"status": "ok"})
@@ -303,16 +362,19 @@ async def handle_motd(request):
     return web.json_response({"text": "Figura Unchained Backend", "color": "gold"})
 
 async def handle_register(request):
-    client_uuid, client_hash = await read_auth_body(request)
+    ip = request['real_ip']
+    client_uuid, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
+        log_warn(f"[AUTH] register REJECT ip={ip} reason=bad-request: {reason}")
         return web.json_response({"error": "Invalid data format"}, status=400)
         
-    success = await asyncio.to_thread(db_register_sync, client_uuid, client_hash, request['real_ip'])
+    success = await asyncio.to_thread(db_register_sync, client_uuid, client_hash, ip)
     if not success:
+        log_info(f"[AUTH] register FAIL uuid={fmt_uuid(client_uuid)} ip={ip} reason=already-registered")
         return web.json_response({"error": "Already registered. Please login."}, status=409)
     
     token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
-    log_info(f"[AUTH] Registered UUID {client_uuid[:8]} from IP {request['real_ip']}")
+    log_info(f"[AUTH] register OK uuid={fmt_uuid(client_uuid)} ip={ip}")
     return web.json_response({
         "status": "success", 
         "token": token, 
@@ -321,16 +383,21 @@ async def handle_register(request):
     })
 
 async def handle_login(request):
-    client_uuid, client_hash = await read_auth_body(request)
+    ip = request['real_ip']
+    client_uuid, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
+        log_warn(f"[AUTH] login REJECT ip={ip} reason=bad-request: {reason}")
         return web.json_response({"error": "Invalid data format"}, status=400)
         
-    success = await asyncio.to_thread(db_login_sync, client_uuid, client_hash, request['real_ip'])
+    success = await asyncio.to_thread(db_login_sync, client_uuid, client_hash, ip)
     if not success:
+        registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
+        why = "wrong-password" if registered else "uuid-not-registered"
+        log_info(f"[AUTH] login FAIL uuid={fmt_uuid(client_uuid)} ip={ip} reason={why}")
         return web.json_response({"error": "Invalid password or UUID"}, status=401)
         
     token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
-    log_info(f"[AUTH] Logged in UUID {client_uuid[:8]} from IP {request['real_ip']}")
+    log_info(f"[AUTH] login OK uuid={fmt_uuid(client_uuid)} ip={ip}")
     return web.json_response({"status": "success", "token": token})
 
 async def handle_user_profile(request):
@@ -343,7 +410,7 @@ async def handle_user_profile(request):
             hash_cache[target_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
             
         equipped.append({"owner": target_uuid, "id": "avatar", "hash": hash_cache[target_uuid]})
-        log_debug(f"[PROFILER] Serving profile {target_uuid[:8]}")
+        log_debug(f"[PROFILER] Serving profile {target_uuid}")
         
     return web.json_response({"equipped": equipped, "equippedBadges": {"pride": [], "special": []}}, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
@@ -386,35 +453,43 @@ async def iter_upload_body(first_chunk, content):
     async for chunk in content.iter_chunked(65536):
         yield chunk
 
+def reject_upload(client_uuid, ip, status, reason, message):
+    log_info(f"[UPLOAD] REJECT {status} uuid={fmt_uuid(client_uuid)} ip={ip} reason={reason}")
+    return web.json_response({"error": message}, status=status)
+
 async def upload_avatar(request):
+    ip = request['real_ip']
     raw_token = request.headers.get('token', '')
     client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
     
     if not is_valid_uuid(client_uuid):
+        log_warn(f"[UPLOAD] REJECT 400 ip={ip} reason=invalid-token-uuid value={shown(client_uuid)}")
         return web.json_response({"error": "Invalid token"}, status=400)
         
-    if not check_auth(request, client_uuid):
+    authed, auth_reason = auth_status(request, client_uuid)
+    if not authed:
+        log_info(f"[UPLOAD] REJECT 401 uuid={fmt_uuid(client_uuid)} ip={ip} reason={auth_reason}")
         return web.json_response({"error": "Unauthorized. Please login."}, status=401)
         
     if request.content_length and request.content_length > MAX_AVATAR_SIZE:
-        return web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
+        return reject_upload(client_uuid, ip, 413, f"too-large declared={request.content_length} limit={MAX_AVATAR_SIZE}", "File exceeds MAX_AVATAR_SIZE")
 
     file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
     loop = asyncio.get_running_loop()
     
     try:
         first_chunk_data = await request.content.read(65536)
-    except Exception:
-        return web.json_response({"error": "Read error"}, status=400)
+    except Exception as e:
+        return reject_upload(client_uuid, ip, 400, f"read-error {e!r}", "Read error")
 
     if not first_chunk_data:
-        return web.json_response({"error": "Empty file"}, status=400)
+        return reject_upload(client_uuid, ip, 400, "empty-body", "Empty file")
 
     if len(first_chunk_data) < 2 or first_chunk_data[:2] != b'\x1f\x8b':
-        return web.json_response({"error": "Invalid format. Only compressed NBT allowed."}, status=400)
+        return reject_upload(client_uuid, ip, 400, "not-gzip", "Invalid format. Only compressed NBT allowed.")
     
     if len(first_chunk_data) > MAX_AVATAR_SIZE:
-        return web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
+        return reject_upload(client_uuid, ip, 413, f"too-large size={len(first_chunk_data)} limit={MAX_AVATAR_SIZE}", "File exceeds MAX_AVATAR_SIZE")
     
     tmp_path = f"{file_path}.{secrets.token_hex(6)}.tmp"
     validator = GzipValidator(MAX_AVATAR_UNPACKED_SIZE)
@@ -426,21 +501,20 @@ async def upload_avatar(request):
             async for chunk in iter_upload_body(first_chunk_data, request.content):
                 bytes_written += len(chunk)
                 if bytes_written > MAX_AVATAR_SIZE:
-                    error = web.json_response({"error": "File exceeds MAX_AVATAR_SIZE"}, status=413)
+                    error = reject_upload(client_uuid, ip, 413, f"too-large stream>{MAX_AVATAR_SIZE}", "File exceeds MAX_AVATAR_SIZE")
                     break
                 try:
                     within_limit = await loop.run_in_executor(None, validator.feed, chunk)
-                except zlib.error:
-                    error = web.json_response({"error": "Invalid format. Only compressed NBT allowed."}, status=400)
+                except zlib.error as e:
+                    error = reject_upload(client_uuid, ip, 400, f"gzip-corrupt {e}", "Invalid format. Only compressed NBT allowed.")
                     break
                 if not within_limit:
-                    log_info(f"[UPLOAD] UUID {client_uuid[:8]} rejected: unpacked size over limit.")
-                    error = web.json_response({"error": "File exceeds MAX_AVATAR_UNPACKED_SIZE"}, status=413)
+                    error = reject_upload(client_uuid, ip, 413, f"unpacked-too-large limit={MAX_AVATAR_UNPACKED_SIZE}", "File exceeds MAX_AVATAR_UNPACKED_SIZE")
                     break
                 await loop.run_in_executor(None, f.write, chunk)
 
         if error is None and not validator.complete():
-            error = web.json_response({"error": "Invalid format. Only compressed NBT allowed."}, status=400)
+            error = reject_upload(client_uuid, ip, 400, "gzip-incomplete", "Invalid format. Only compressed NBT allowed.")
 
         if error is not None:
             return error
@@ -452,7 +526,8 @@ async def upload_avatar(request):
 
     hash_cache[client_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
     users_with_avatars.add(client_uuid)
-    log_info(f"[UPLOAD] UUID {client_uuid[:8]} saved skin ({bytes_written} bytes).")
+    watchers = len(subscriptions.get(client_uuid, ()))
+    log_info(f"[UPLOAD] OK uuid={fmt_uuid(client_uuid)} ip={ip} bytes={bytes_written} watchers={watchers}")
 
     if client_uuid in subscriptions:
         uuid_bytes = uuid.UUID(client_uuid).bytes
@@ -460,7 +535,7 @@ async def upload_avatar(request):
         for sub_uuid in subscriptions[client_uuid]:
             if sub_uuid != client_uuid and sub_uuid in active_connections:
                 await active_connections[sub_uuid].send_bytes(event_packet)
-                log_debug(f"[EVENT-OUT] Skin update -> {sub_uuid[:8]}")
+                log_debug(f"[EVENT-OUT] Skin update -> {sub_uuid}")
 
     return web.json_response({"status": "success"})
 
@@ -468,13 +543,17 @@ async def equip_avatar(request):
     return web.json_response({"status": "success"})
 
 async def delete_avatar(request):
+    ip = request['real_ip']
     raw_token = request.headers.get('token', '')
     client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
     
     if not is_valid_uuid(client_uuid):
+        log_warn(f"[DELETE] REJECT 400 ip={ip} reason=invalid-token-uuid value={shown(client_uuid)}")
         return web.json_response({"error": "Invalid token"}, status=400)
         
-    if not check_auth(request, client_uuid):
+    authed, auth_reason = auth_status(request, client_uuid)
+    if not authed:
+        log_info(f"[DELETE] REJECT 401 uuid={fmt_uuid(client_uuid)} ip={ip} reason={auth_reason}")
         return web.json_response({"error": "Unauthorized. Please login."}, status=401)
 
     file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
@@ -482,7 +561,7 @@ async def delete_avatar(request):
         await asyncio.to_thread(os.remove, file_path)
         users_with_avatars.discard(client_uuid)
         hash_cache.pop(client_uuid, None)
-        log_info(f"[DELETE] Deleted skin for: {client_uuid[:8]}")
+        log_info(f"[DELETE] OK uuid={fmt_uuid(client_uuid)} ip={ip}")
         
         if client_uuid in subscriptions:
             uuid_bytes = uuid.UUID(client_uuid).bytes
@@ -490,13 +569,16 @@ async def delete_avatar(request):
             for sub_uuid in subscriptions[client_uuid]:
                 if sub_uuid != client_uuid and sub_uuid in active_connections:
                     await active_connections[sub_uuid].send_bytes(event_packet)
-                    log_debug(f"[EVENT-OUT] Skin deletion -> {sub_uuid[:8]}")
+                    log_debug(f"[EVENT-OUT] Skin deletion -> {sub_uuid}")
+    else:
+        log_info(f"[DELETE] uuid={fmt_uuid(client_uuid)} ip={ip} nothing to delete (no avatar stored)")
                         
     return web.json_response({"status": "deleted"})
 
 async def websocket_handler(request):
     real_ip = request['real_ip']
     if ip_connections.get(real_ip, 0) >= WS_MAX_CONNECTIONS_PER_IP:
+        log_throttled(f"wsip:{real_ip}", f"[WS] REJECT 429 ip={real_ip} reason=too-many-connections limit={WS_MAX_CONNECTIONS_PER_IP}")
         return web.Response(status=429)
 
     ip_connections[real_ip] = ip_connections.get(real_ip, 0) + 1
@@ -509,19 +591,37 @@ async def websocket_handler(request):
         client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
         
         if not is_valid_uuid(client_uuid):
-            log_info(f"[WS] Connection rejected (invalid token) from IP: {real_ip}")
+            reason = "no-token-header" if not raw_token else "malformed-uuid"
+            log_warn(f"[WS] REJECT ip={real_ip} reason={reason} value={shown(client_uuid)}")
             return ws
             
-        is_authenticated = check_auth(request, client_uuid)
+        is_authenticated, auth_reason = auth_status(request, client_uuid)
 
         file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
-        if os.path.exists(file_path):
+        has_avatar = os.path.exists(file_path)
+        if has_avatar:
             users_with_avatars.add(client_uuid)
         else:
             users_with_avatars.discard(client_uuid)
 
+        is_registered = None
+        if REQUIRE_AUTH and not is_authenticated:
+            is_registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
+
+        previous = active_connections.get(client_uuid)
+        if previous is not None and previous is not ws:
+            log_warn(f"[WS] duplicate session uuid={fmt_uuid(client_uuid)} ip={real_ip}: an older connection with this UUID is still registered and is being replaced")
+
         active_connections[client_uuid] = ws
-        log_info(f"[WS] + Connected {client_uuid[:8]} (Auth: {is_authenticated}). Online: {len(active_connections)}")
+        connected_at = time.time()
+
+        if not REQUIRE_AUTH:
+            auth_text = "disabled"
+        elif is_authenticated:
+            auth_text = "yes"
+        else:
+            auth_text = f"NO reason={auth_reason} registered={'yes' if is_registered else 'no'}"
+        log_info(f"[WS] + connect uuid={fmt_uuid(client_uuid)} ip={real_ip} auth={auth_text} avatar={'yes' if has_avatar else 'no'} online={len(active_connections)}")
         
         ping_bytes_sec = 0
         ping_reset_time = time.time()
@@ -529,13 +629,20 @@ async def websocket_handler(request):
         msg_reset_time = time.time()
         client_subs = 0
         auth_msg = ""
+        pings_in = 0
+        pings_relayed = 0
+        drops = {}
+
+        def note_drop(kind, reason, detail=""):
+            drops[reason] = drops.get(reason, 0) + 1
+            if drops[reason] == 1:
+                log_warn(f"[WS] dropped {kind} uuid={fmt_uuid(client_uuid)} ip={real_ip} reason={reason} {detail} (further drops this session are only counted)")
         
         try:
             await ws.send_bytes(b'\x00')
             
             if REQUIRE_AUTH:
                 if not is_authenticated:
-                    is_registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
                     if is_registered:
                         auth_msg = "Type /figura-unchained login <password>"
                     else:
@@ -560,23 +667,27 @@ async def websocket_handler(request):
                     msg_count += 1
                     
                     if msg_count > WS_MAX_MESSAGES_PER_SEC:
+                        note_drop("message", "message-rate-limit", f"limit={WS_MAX_MESSAGES_PER_SEC}/s")
                         await ws.send_bytes(b'\x05\x01')
                         continue
                     
                     if cmd == 0:
-                        log_debug(f"[WS-TOKEN] Ignored token packet from {client_uuid[:8]}")
+                        log_debug(f"[WS-TOKEN] Ignored token packet from {client_uuid}")
                         
                     elif cmd == 1:
+                        pings_in += 1
                         if not is_authenticated:
+                            note_drop("ping", "not-authenticated", "(player has to /figura-unchained login or register)")
                             toast_packet = b'\x03\x02' + "Auth Required".encode('utf-8') + b'\x00' + auth_msg.encode('utf-8')
                             await ws.send_bytes(toast_packet)
                             continue
 
                         if client_uuid not in users_with_avatars:
+                            note_drop("ping", "no-avatar-uploaded", "(pings are relayed only for UUIDs that have an uploaded avatar)")
                             continue
                             
                         if len(data) > MAX_PING_SIZE:
-                            log_debug(f"[WS-PING-LIMIT] {client_uuid[:8]} exceeded size ({len(data)} bytes)")
+                            note_drop("ping", "ping-too-large", f"size={len(data)} limit={MAX_PING_SIZE}")
                             await ws.send_bytes(b'\x05\x00') 
                             continue
                             
@@ -586,22 +697,25 @@ async def websocket_handler(request):
                             
                         ping_bytes_sec += len(data)
                         if ping_bytes_sec > MAX_PING_BPS:
-                            log_debug(f"[WS-PING-LIMIT] {client_uuid[:8]} exceeded rate limit")
+                            note_drop("ping", "ping-rate-limit", f"limit={MAX_PING_BPS} B/s")
                             await ws.send_bytes(b'\x05\x01')
                             continue
 
-                        log_debug(f"[WS-PING-IN] From {client_uuid[:8]} | RAW: {hex_dump(data)}")
                         uuid_bytes = uuid.UUID(client_uuid).bytes
                         s2c_packet = data[0:1] + uuid_bytes + data[1:]
                         
+                        recipients = 0
                         if client_uuid in subscriptions:
                             for sub_uuid in subscriptions[client_uuid]:
                                 if sub_uuid != client_uuid and sub_uuid in active_connections:
                                     await active_connections[sub_uuid].send_bytes(s2c_packet)
-                                    log_debug(f"[WS-PING-OUT] To {sub_uuid[:8]} | RAW: {hex_dump(s2c_packet)}")
+                                    recipients += 1
+                        pings_relayed += 1
+                        log_debug(f"[WS-PING] uuid={client_uuid} size={len(data)} -> {recipients} recipient(s)")
                     
                     elif cmd == 2 and len(data) >= 17:
                         if client_subs >= WS_MAX_SUBS_PER_CLIENT:
+                            note_drop("subscribe", "subscription-limit", f"limit={WS_MAX_SUBS_PER_CLIENT}")
                             continue
                         target_uuid = str(uuid.UUID(bytes=data[1:17]))
                         if target_uuid not in subscriptions:
@@ -609,7 +723,7 @@ async def websocket_handler(request):
                         if client_uuid not in subscriptions[target_uuid]:
                             subscriptions[target_uuid].add(client_uuid)
                             client_subs += 1
-                        log_debug(f"[WS-SUB] {client_uuid[:8]} -> {target_uuid[:8]}")
+                        log_debug(f"[WS-SUB] {client_uuid} -> {target_uuid}")
                         
                         uuid_bytes = uuid.UUID(target_uuid).bytes
                         event_packet = b'\x02' + uuid_bytes
@@ -620,11 +734,17 @@ async def websocket_handler(request):
                         if target_uuid in subscriptions and client_uuid in subscriptions[target_uuid]:
                             subscriptions[target_uuid].remove(client_uuid)
                             client_subs -= 1
-                            log_debug(f"[WS-UNSUB] {client_uuid[:8]} -/-> {target_uuid[:8]}")
+                            log_debug(f"[WS-UNSUB] {client_uuid} -/-> {target_uuid}")
                     
                 elif msg.type == WSMsgType.ERROR:
-                    log_info(f"[WS] Error in {client_uuid[:8]}: {ws.exception()}")
+                    log_warn(f"[WS] error uuid={fmt_uuid(client_uuid)} ip={real_ip}: {ws.exception()!r}")
+        except ConnectionError as e:
+            log_info(f"[WS] connection lost uuid={fmt_uuid(client_uuid)} ip={real_ip}: {e!r}")
+        except Exception:
+            logging.exception(f"[WS] Unhandled error in session uuid={fmt_uuid(client_uuid)} ip={real_ip}")
         finally:
+            current = active_connections.get(client_uuid)
+            replaced = current is not None and current is not ws
             if client_uuid in active_connections:
                 del active_connections[client_uuid]
             
@@ -634,7 +754,10 @@ async def websocket_handler(request):
                     if not subscriptions[target]:
                         del subscriptions[target]
                         
-            log_info(f"[WS] - Disconnected {client_uuid[:8]}. Online: {len(active_connections)}")
+            drops_text = ", ".join(f"{k}={v}" for k, v in drops.items()) or "none"
+            log_info(f"[WS] - disconnect uuid={fmt_uuid(client_uuid)} ip={real_ip} time={fmt_dur(time.time() - connected_at)} code={ws.close_code} pings={pings_in} relayed={pings_relayed} drops={drops_text} subs={client_subs} online={len(active_connections)}")
+            if replaced:
+                log_warn(f"[WS] uuid={fmt_uuid(client_uuid)}: this closed connection had been replaced by a newer one, and the registry entry of the newer session was removed too")
     finally:
         ip_connections[real_ip] -= 1
         if ip_connections[real_ip] <= 0:
@@ -651,6 +774,8 @@ async def cleanup_rate_limits(app):
             del rate_limits[ip]
         for ip in [ip for ip, d in auth_rate_limits.items() if now > d["reset"]]:
             del auth_rate_limits[ip]
+        for key in [k for k, v in throttle_state.items() if now - v[0] > 600]:
+            del throttle_state[key]
 
 def process_admin_commands():
     commands = []
@@ -659,8 +784,8 @@ def process_admin_commands():
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             commands.append(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"[ADMIN] Unreadable command file {file_path}: {e!r}")
         finally:
             try:
                 os.remove(file_path)
@@ -693,6 +818,9 @@ async def admin_command_poller(app):
                 if title or desc:
                     packet = b'\x03' + bytes([t_type]) + title.encode('utf-8') + b'\0' + desc.encode('utf-8')
             
+            if not packet:
+                logging.warning(f"[ADMIN] Command {b_type!r} ignored (unknown type or empty content)")
+
             if packet:
                 count = 0
                 for ws in list(active_connections.values()):
@@ -700,12 +828,21 @@ async def admin_command_poller(app):
                         await ws.send_bytes(packet)
                         count += 1
                     except Exception as e:
-                        logging.debug(f"[ADMIN] Failed to send to a client: {e}")
+                        logging.warning(f"[ADMIN] Failed to send to a client: {e!r}")
                 logging.info(f"[ADMIN] Broadcasted {b_type} to {count} users.")
 
+def log_task_exit(task):
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logging.error(f"[SYS] Background task {task.get_name()} crashed: {exc!r}", exc_info=exc)
+
 async def start_background_tasks(app):
-    app['cleanup_task'] = asyncio.create_task(cleanup_rate_limits(app))
-    app['admin_poller_task'] = asyncio.create_task(admin_command_poller(app))
+    app['cleanup_task'] = asyncio.create_task(cleanup_rate_limits(app), name="cleanup_rate_limits")
+    app['admin_poller_task'] = asyncio.create_task(admin_command_poller(app), name="admin_command_poller")
+    app['cleanup_task'].add_done_callback(log_task_exit)
+    app['admin_poller_task'].add_done_callback(log_task_exit)
 
 async def cleanup_background_tasks(app):
     app['cleanup_task'].cancel()
@@ -742,10 +879,18 @@ app.router.add_get('/ws', websocket_handler)
 app.router.add_get('/api/ws', websocket_handler)
 app.router.add_get('/api//ws', websocket_handler)
 
+def log_startup_summary():
+    with db_lock:
+        users = db_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    avatars = len(glob.glob(os.path.join(AVATAR_DIR, "*.nbt")))
+    log_info(f"[SYS] Starting on {HOST}:{PORT} | debug={DEBUG} require_auth={REQUIRE_AUTH} | registered_users={users} avatars={avatars}")
+    log_info(f"[SYS] Limits: avatar={MAX_AVATAR_SIZE}B (unpacked {MAX_AVATAR_UNPACKED_SIZE}B), ping={MAX_PING_SIZE}B/{MAX_PING_BPS}Bps | http={RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s, auth={LOGIN_RATE_LIMIT_REQUESTS}/{LOGIN_RATE_LIMIT_WINDOW}s | ws: {WS_MAX_CONNECTIONS_PER_IP} conn/ip, {WS_MAX_MESSAGES_PER_SEC} msg/s, {WS_MAX_SUBS_PER_CLIENT} subs | trusted_proxies={len(trusted_networks)}")
+
 if __name__ == '__main__':
     try:
-        log_info(f"Starting Server on host {HOST} port {PORT}...")
+        log_startup_summary()
         web.run_app(app, host=HOST, port=PORT, access_log=None, print=None)
+        log_info("[SYS] Server stopped")
     except OSError as e:
         if e.errno in (98, 10048):
             print(f"\n[FATAL ERROR] Port {PORT} is already in use!")
