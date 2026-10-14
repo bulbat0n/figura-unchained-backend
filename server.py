@@ -338,7 +338,7 @@ def addon_version_status(version):
         return "outdated"
     return "ok"
 
-UPDATE_TOAST_PACKET = b'\x03\x01' + "Please update Figura Unchained".encode('utf-8') + b'\x00' + f"Minimum version for your backend is {MIN_ADDON_VERSION_RAW}".encode('utf-8')
+UPDATE_TOAST_PACKET = b'\x03\x02' + "Please update Figura Unchained".encode('utf-8') + b'\x00' + f"Minimum version for your backend is {MIN_ADDON_VERSION_RAW}".encode('utf-8')
 
 async def safe_send(ws, packet):
     try:
@@ -464,6 +464,7 @@ ip_connections = {}
 auth_rate_limits = {}
 AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
 WS_PATHS = ('/ws', '/api/ws', '/api//ws')
+VERSION_EXEMPT_PATHS = ('/api', '/api/', '/api/version', '/api/limits', '/api/motd')
 seen_http_clients = set()
 
 def init_identity_state():
@@ -525,6 +526,13 @@ async def security_middleware(request, handler):
         log_debug(f"[HTTP] {request.method} {request.path!r} ip={real_ip}")
 
     note_http_client(request, real_ip)
+
+    if (request.path.startswith('/api/') or request.path.startswith('/assets/')) and request.path not in WS_PATHS and request.path not in VERSION_EXEMPT_PATHS:
+        http_version = clean_version(request.headers.get('addon-version'))
+        http_status = addon_version_status(http_version)
+        if http_status != "ok":
+            log_throttled(f"oldhttp:{real_ip}", f"[HTTP] REJECT 426 ip={real_ip} {request.method} {request.path!r} addon-version={http_version or 'none'} status={http_status} (minimum {MIN_ADDON_VERSION_RAW})")
+            return web.json_response({"error": f"Please update Figura Unchained. Minimum version for your backend is {MIN_ADDON_VERSION_RAW}"}, status=426)
 
     try:
         return await handler(request)
@@ -815,13 +823,20 @@ async def websocket_handler(request):
             log_warn(f"[WS] REJECT ip={real_ip} reason={reason} value={shown(client_uuid)}")
             return ws
             
+        addon_version = clean_version(request.headers.get('addon-version'))
+        version_status = addon_version_status(addon_version)
+        if version_status != "ok":
+            log_warn(f"[WS] REJECT {user_tag(client_uuid)} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW}): all requests from this connection are ignored")
+            await safe_send(ws, UPDATE_TOAST_PACKET)
+            async for _ in ws:
+                pass
+            return ws
+
         is_authenticated, auth_reason = auth_status(request, client_uuid)
 
         username, session_uuid = resolve_client_identity(request, client_uuid)
         ident = username or client_uuid
         tag = user_tag(client_uuid)
-        addon_version = clean_version(request.headers.get('addon-version'))
-        version_status = addon_version_status(addon_version)
 
         if REQUIRE_AUTH and not is_authenticated and active_auth.get(ident) and ident in active_connections:
             log_warn(f"[WS] REJECT {tag} ip={real_ip} reason=authenticated-session-online (an unauthenticated connection cannot replace it)")
@@ -897,10 +912,6 @@ async def websocket_handler(request):
                 else:
                     toast_packet = b'\x03\x00' + "Authenticated".encode('utf-8') + b'\x00' + "Connected successfully.".encode('utf-8')
                     await ws.send_bytes(toast_packet)
-
-            if version_status != "ok":
-                log_warn(f"[WS] addon update needed {tag} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW})")
-                await ws.send_bytes(UPDATE_TOAST_PACKET)
 
             if registered_session and has_avatar:
                 for watcher in list(subscriptions.get(registered_session, ())):
