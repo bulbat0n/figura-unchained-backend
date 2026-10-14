@@ -16,6 +16,7 @@ import logging
 import json
 import glob
 import zlib
+from urllib.parse import unquote_plus
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from aiohttp import web, WSMsgType
@@ -30,7 +31,7 @@ REQUIRED_VARS = [
     "RATE_LIMIT_CLEANUP_INTERVAL", "WS_MAX_CONNECTIONS_PER_IP",
     "WS_MAX_MESSAGES_PER_SEC", "WS_MAX_SUBS_PER_CLIENT",
     "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW",
-    "MAX_AVATAR_UNPACKED_SIZE"
+    "MAX_AVATAR_UNPACKED_SIZE", "MIN_ADDON_VERSION"
 ]
 
 missing_vars = [var for var in REQUIRED_VARS if not os.environ.get(var)]
@@ -93,6 +94,17 @@ for net in os.environ.get("TRUSTED_PROXIES").split(","):
     except ValueError:
         config_errors.append(f"Invalid TRUSTED_PROXIES format: {net}")
 
+ADDON_VERSION_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)')
+
+def parse_addon_version(raw):
+    match = ADDON_VERSION_RE.match(raw or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+MIN_ADDON_VERSION_RAW = os.environ.get("MIN_ADDON_VERSION").strip()
+MIN_ADDON_VERSION = parse_addon_version(MIN_ADDON_VERSION_RAW)
+if MIN_ADDON_VERSION is None:
+    config_errors.append(f"MIN_ADDON_VERSION must look like '1.9.3', got '{MIN_ADDON_VERSION_RAW}'")
+
 if config_errors:
     print("[FATAL ERROR] .env syntax/value errors found:")
     for err in config_errors:
@@ -120,7 +132,9 @@ def save_secure_file(path, content):
         f.write(content)
 
 db_conn = sqlite3.connect('data/users.db', check_same_thread=False)
-db_conn.execute('CREATE TABLE IF NOT EXISTS users (uuid TEXT PRIMARY KEY, password_hash TEXT, last_ip TEXT)')
+db_conn.execute('CREATE TABLE IF NOT EXISTS users (uuid TEXT PRIMARY KEY, username TEXT, password_hash TEXT, last_ip TEXT)')
+if 'username' not in [row[1] for row in db_conn.execute("PRAGMA table_info(users)")]:
+    db_conn.execute('ALTER TABLE users ADD COLUMN username TEXT')
 db_conn.commit()
 db_lock = threading.Lock()
 
@@ -197,6 +211,151 @@ def fmt_dur(seconds):
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
 
+uuid_to_username = {}
+user_session_uuids = {}
+user_canonical_uuids = {}
+
+def canonical_uuid_for(username):
+    digest = hashlib.md5(f"OfflinePlayer:{username}".encode('utf-8')).digest()
+    return str(uuid.UUID(bytes=digest, version=3))
+
+def clean_username(name):
+    if not isinstance(name, str) or not 1 <= len(name) <= 32:
+        return None
+    if UUID_REGEX.match(name):
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return None
+    return name
+
+def decode_header_name(raw):
+    if not raw:
+        return None
+    try:
+        return clean_username(unquote_plus(raw))
+    except Exception:
+        return None
+
+def username_for_canonical(canonical):
+    name = uuid_to_username.get(canonical)
+    if name is not None and user_canonical_uuids.get(name) == canonical:
+        return name
+    return None
+
+def resolve_canonical(any_uuid):
+    name = uuid_to_username.get(any_uuid)
+    if name is not None:
+        return user_canonical_uuids.get(name, any_uuid)
+    return any_uuid
+
+def register_known_user(username):
+    canonical = canonical_uuid_for(username)
+    squatter = uuid_to_username.get(canonical)
+    if squatter is not None and squatter != username and user_session_uuids.get(squatter) == canonical:
+        drop_session_alias(squatter)
+    user_canonical_uuids[username] = canonical
+    uuid_to_username[canonical] = username
+    uuid_to_username[username] = username
+    return canonical
+
+def drop_session_alias(username):
+    session = user_session_uuids.pop(username, None)
+    if session is not None and uuid_to_username.get(session) == username:
+        del uuid_to_username[session]
+
+def register_session_alias(username, session_uuid):
+    if session_uuid == user_canonical_uuids.get(username):
+        drop_session_alias(username)
+        return True, "same-as-canonical"
+    owner = uuid_to_username.get(session_uuid)
+    if owner is not None and owner != username:
+        return False, f"already-bound-to {owner}"
+    if user_session_uuids.get(username) not in (None, session_uuid):
+        drop_session_alias(username)
+    user_session_uuids[username] = session_uuid
+    uuid_to_username[session_uuid] = username
+    return True, "ok"
+
+def aliases_of(ident):
+    canonical = user_canonical_uuids.get(ident) or (ident if is_valid_uuid(ident) else None)
+    result = [canonical] if canonical else []
+    session = user_session_uuids.get(ident)
+    if session and session not in result:
+        result.append(session)
+    return result
+
+def get_watchers_for_user(ident):
+    watchers = {}
+    for alias in aliases_of(ident):
+        for watcher in subscriptions.get(alias, ()):
+            if watcher != ident and watcher not in watchers:
+                watchers[watcher] = alias
+    return watchers
+
+def display_name(value):
+    if not value:
+        return "?"
+    name = uuid_to_username.get(value)
+    if name is not None:
+        return name
+    return short_uuid(value) if is_valid_uuid(value) else str(value)
+
+def user_tag(canonical):
+    name = username_for_canonical(canonical)
+    return f"username={name}" if name else f"username=? uuid={fmt_uuid(canonical)}"
+
+def resolve_client_identity(request, canonical):
+    username = username_for_canonical(canonical)
+    raw_name = request.headers.get('client-username')
+    session_uuid = None
+    if raw_name:
+        claimed = decode_header_name(raw_name)
+        if claimed is None:
+            log_warn(f"[ID] ignored malformed client-username {shown(raw_name)} (canonical_uuid={canonical})")
+        elif canonical_uuid_for(claimed) != canonical:
+            log_warn(f"[ID] client-username={claimed!r} does not match canonical_uuid={canonical}; claim ignored")
+        else:
+            username = claimed
+            register_known_user(username)
+            raw_session = request.headers.get('client-uuid', '').strip().lower()
+            if is_valid_uuid(raw_session):
+                session_uuid = raw_session
+    return username, session_uuid
+
+VERSION_TOKEN_RE = re.compile(r'^[0-9A-Za-z.+_\-]{1,64}$')
+
+def clean_version(raw):
+    raw = (raw or '').strip()
+    return raw if VERSION_TOKEN_RE.match(raw) else None
+
+def addon_version_status(version):
+    if not version:
+        return "missing"
+    parsed = parse_addon_version(version)
+    if parsed is None:
+        return "invalid"
+    if parsed < MIN_ADDON_VERSION:
+        return "outdated"
+    return "ok"
+
+UPDATE_TOAST_PACKET = b'\x03\x01' + "Please update Figura Unchained".encode('utf-8') + b'\x00' + f"Minimum version for your backend is {MIN_ADDON_VERSION_RAW}".encode('utf-8')
+
+async def safe_send(ws, packet):
+    try:
+        await ws.send_bytes(packet)
+        return True
+    except Exception as e:
+        log_debug(f"[WS] send failed: {e!r}")
+        return False
+
+async def notify_avatar_update(ident, reason):
+    watchers = get_watchers_for_user(ident)
+    for watcher, alias in watchers.items():
+        target_ws = active_connections.get(watcher)
+        if target_ws is not None and await safe_send(target_ws, b'\x02' + uuid.UUID(alias).bytes):
+            log_debug(f"[EVENT-OUT] {reason} {display_name(ident)} -> {display_name(watcher)}")
+    return len(watchers)
+
 def get_file_hash_sync(filepath):
     hasher = hashlib.sha256()
     with open(filepath, 'rb') as f:
@@ -210,30 +369,42 @@ def db_is_registered_sync(client_uuid):
         cursor.execute("SELECT 1 FROM users WHERE uuid = ?", (client_uuid,))
         return cursor.fetchone() is not None
 
-def db_register_sync(client_uuid, client_hash, real_ip):
+def db_register_sync(client_uuid, username, client_hash, real_ip):
     if db_is_registered_sync(client_uuid):
         return False
     hashed_pw = bcrypt.hashpw(client_hash.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     with db_lock:
         try:
-            db_conn.execute("INSERT INTO users (uuid, password_hash, last_ip) VALUES (?, ?, ?)", (client_uuid, hashed_pw, real_ip))
+            db_conn.execute("INSERT INTO users (uuid, username, password_hash, last_ip) VALUES (?, ?, ?, ?)", (client_uuid, username, hashed_pw, real_ip))
             db_conn.commit()
         except sqlite3.IntegrityError:
             db_conn.rollback()
             return False
     return True
 
-def db_login_sync(client_uuid, client_hash, real_ip):
+def db_login_sync(client_uuid, username, client_hash, real_ip):
     with db_lock:
         row = db_conn.execute("SELECT password_hash FROM users WHERE uuid = ?", (client_uuid,)).fetchone()
     if not row:
         return False
     if bcrypt.checkpw(client_hash.encode('utf-8'), row[0].encode('utf-8')):
         with db_lock:
-            db_conn.execute("UPDATE users SET last_ip = ? WHERE uuid = ?", (real_ip, client_uuid))
+            db_conn.execute("UPDATE users SET last_ip = ?, username = COALESCE(?, username) WHERE uuid = ?", (real_ip, username, client_uuid))
             db_conn.commit()
         return True
     return False
+
+def load_user_aliases():
+    with db_lock:
+        rows = db_conn.execute("SELECT uuid, username FROM users WHERE username IS NOT NULL").fetchall()
+    loaded = 0
+    for stored_uuid, username in rows:
+        if clean_username(username) is None or canonical_uuid_for(username) != stored_uuid:
+            log_warn(f"[SYS] users table: username={username!r} does not match uuid={stored_uuid}, alias skipped")
+            continue
+        register_known_user(username)
+        loaded += 1
+    return loaded
 
 def auth_status(request, client_uuid):
     if not REQUIRE_AUTH:
@@ -284,6 +455,7 @@ def get_real_ip(request):
     return request.remote
 
 active_connections = {}
+active_auth = {}
 subscriptions = {}
 users_with_avatars = set()
 rate_limits = {}
@@ -292,6 +464,35 @@ ip_connections = {}
 auth_rate_limits = {}
 AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
 WS_PATHS = ('/ws', '/api/ws', '/api//ws')
+seen_http_clients = set()
+
+def init_identity_state():
+    loaded = load_user_aliases()
+    for path in glob.glob(os.path.join(AVATAR_DIR, "*.nbt")):
+        users_with_avatars.add(os.path.basename(path)[:-4].lower())
+    return loaded
+
+known_users_at_start = init_identity_state()
+
+def note_http_client(request, real_ip):
+    raw_version = request.headers.get('addon-version')
+    raw_token = request.headers.get('token')
+    if raw_version is None and raw_token is None:
+        return
+    token_uuid = (raw_token or '').split(':')[0].lower()
+    version = clean_version(raw_version)
+    key = (token_uuid or real_ip, version)
+    if key in seen_http_clients:
+        return
+    if len(seen_http_clients) > 10000:
+        seen_http_clients.clear()
+    seen_http_clients.add(key)
+    who = display_name(token_uuid) if is_valid_uuid(token_uuid) else f"ip={real_ip}"
+    status = addon_version_status(version)
+    if status == "ok":
+        log_info(f"[HTTP] client {who} addon-version={version}")
+    else:
+        log_warn(f"[HTTP] client {who} addon-version={version or 'none'} status={status} (minimum {MIN_ADDON_VERSION_RAW})")
 
 @web.middleware
 async def security_middleware(request, handler):
@@ -323,6 +524,8 @@ async def security_middleware(request, handler):
     if request.path not in ignore_logs:
         log_debug(f"[HTTP] {request.method} {request.path!r} ip={real_ip}")
 
+    note_http_client(request, real_ip)
+
     try:
         return await handler(request)
     except web.HTTPException:
@@ -337,20 +540,29 @@ async def read_auth_body(request):
     try:
         body = await request.json()
     except Exception:
-        return None, None, "body-is-not-json"
+        return None, None, None, "body-is-not-json"
     if not isinstance(body, dict):
-        return None, None, "body-is-not-an-object"
+        return None, None, None, "body-is-not-an-object"
     client_uuid = body.get("uuid")
     client_hash = body.get("hash")
+    raw_username = body.get("username")
     if not isinstance(client_uuid, str) or not isinstance(client_hash, str):
-        return None, None, "uuid-or-hash-missing"
+        return None, None, None, "uuid-or-hash-missing"
     if not is_valid_uuid(client_uuid):
-        return None, None, f"invalid-uuid-format {shown(client_uuid)}"
+        return None, None, None, f"invalid-uuid-format {shown(client_uuid)}"
     if not client_hash:
-        return None, None, "empty-hash"
+        return None, None, None, "empty-hash"
     if len(client_hash.encode('utf-8')) > 72:
-        return None, None, "hash-too-long"
-    return client_uuid, client_hash, None
+        return None, None, None, "hash-too-long"
+    client_uuid = client_uuid.lower()
+    username = None
+    if raw_username is not None:
+        username = clean_username(raw_username)
+        if username is None:
+            return None, None, None, f"invalid-username {shown(raw_username)}"
+        if canonical_uuid_for(username) != client_uuid:
+            return None, None, None, f"uuid-username-mismatch username={username!r} uuid={client_uuid}"
+    return client_uuid, username, client_hash, None
 
 async def handle_api_check(request):
     return web.json_response({"status": "ok"})
@@ -364,64 +576,78 @@ async def handle_limits(request):
 async def handle_motd(request):
     return web.json_response({"text": "Figura Unchained Backend", "color": "gold"})
 
+def auth_tag(client_uuid, username):
+    name = username or username_for_canonical(client_uuid)
+    return f"username={name or '?'} canonical_uuid={client_uuid}"
+
+def request_version_text(request):
+    version = clean_version(request.headers.get('addon-version'))
+    return f"addon-version={version}" if version else "addon-version=none"
+
 async def handle_register(request):
     ip = request['real_ip']
-    client_uuid, client_hash, reason = await read_auth_body(request)
+    client_uuid, username, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
         log_warn(f"[AUTH] register REJECT ip={ip} reason=bad-request: {reason}")
         return web.json_response({"error": "Invalid data format"}, status=400)
-        
-    success = await asyncio.to_thread(db_register_sync, client_uuid, client_hash, ip)
+
+    success = await asyncio.to_thread(db_register_sync, client_uuid, username, client_hash, ip)
     if not success:
-        log_info(f"[AUTH] register FAIL uuid={fmt_uuid(client_uuid)} ip={ip} reason=already-registered")
+        log_info(f"[AUTH] register FAIL {auth_tag(client_uuid, username)} ip={ip} reason=already-registered")
         return web.json_response({"error": "Already registered. Please login."}, status=409)
-    
+
+    if username:
+        register_known_user(username)
     token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
-    log_info(f"[AUTH] register OK uuid={fmt_uuid(client_uuid)} ip={ip}")
+    log_info(f"[AUTH] register OK {auth_tag(client_uuid, username)} ip={ip} {request_version_text(request)}")
     return web.json_response({
-        "status": "success", 
-        "token": token, 
+        "status": "success",
+        "token": token,
         "title": "Malicious or NSFW content is prohibited",
         "message": "Author IPs are logged by backend's owner"
     })
 
 async def handle_login(request):
     ip = request['real_ip']
-    client_uuid, client_hash, reason = await read_auth_body(request)
+    client_uuid, username, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
         log_warn(f"[AUTH] login REJECT ip={ip} reason=bad-request: {reason}")
         return web.json_response({"error": "Invalid data format"}, status=400)
-        
-    success = await asyncio.to_thread(db_login_sync, client_uuid, client_hash, ip)
+
+    success = await asyncio.to_thread(db_login_sync, client_uuid, username, client_hash, ip)
     if not success:
         registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
         why = "wrong-password" if registered else "uuid-not-registered"
-        log_info(f"[AUTH] login FAIL uuid={fmt_uuid(client_uuid)} ip={ip} reason={why}")
+        log_info(f"[AUTH] login FAIL {auth_tag(client_uuid, username)} ip={ip} reason={why}")
         return web.json_response({"error": "Invalid password or UUID"}, status=401)
-        
+
+    if username:
+        register_known_user(username)
     token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
-    log_info(f"[AUTH] login OK uuid={fmt_uuid(client_uuid)} ip={ip}")
+    log_info(f"[AUTH] login OK {auth_tag(client_uuid, username)} ip={ip} {request_version_text(request)}")
     return web.json_response({"status": "success", "token": token})
 
 async def handle_user_profile(request):
-    target_uuid = os.path.basename(request.match_info['uuid'])
+    requested = os.path.basename(request.match_info['uuid']).lower()
+    target_uuid = resolve_canonical(requested)
     file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
     equipped = []
-    
+
     if os.path.exists(file_path):
         if target_uuid not in hash_cache:
             hash_cache[target_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
-            
-        equipped.append({"owner": target_uuid, "id": "avatar", "hash": hash_cache[target_uuid]})
-        log_debug(f"[PROFILER] Serving profile {target_uuid}")
-        
+
+        equipped.append({"owner": requested, "id": "avatar", "hash": hash_cache[target_uuid]})
+        log_debug(f"[PROFILER] Serving profile {display_name(requested)} (requested={requested} canonical_uuid={target_uuid})")
+
     return web.json_response({"equipped": equipped, "equippedBadges": {"pride": [], "special": []}}, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 async def download_avatar(request):
-    target_uuid = os.path.basename(request.match_info['uuid'])
+    requested = os.path.basename(request.match_info['uuid']).lower()
+    target_uuid = resolve_canonical(requested)
     file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
     if os.path.exists(file_path):
-        log_debug(f"[DOWNLOAD] Serving file: {target_uuid}.nbt")
+        log_debug(f"[DOWNLOAD] Serving avatar of {display_name(requested)} ({target_uuid}.nbt)")
         return web.FileResponse(file_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     return web.json_response({"error": "Not found"}, status=404, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
@@ -457,21 +683,24 @@ async def iter_upload_body(first_chunk, content):
         yield chunk
 
 def reject_upload(client_uuid, ip, status, reason, message):
-    log_info(f"[UPLOAD] REJECT {status} uuid={fmt_uuid(client_uuid)} ip={ip} reason={reason}")
+    log_info(f"[UPLOAD] REJECT {status} {user_tag(client_uuid)} ip={ip} reason={reason}")
     return web.json_response({"error": message}, status=status)
 
 async def upload_avatar(request):
     ip = request['real_ip']
     raw_token = request.headers.get('token', '')
-    client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
+    client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
     
     if not is_valid_uuid(client_uuid):
         log_warn(f"[UPLOAD] REJECT 400 ip={ip} reason=invalid-token-uuid value={shown(client_uuid)}")
         return web.json_response({"error": "Invalid token"}, status=400)
-        
+
+    username, _ = resolve_client_identity(request, client_uuid)
+    ident = username or client_uuid
+
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[UPLOAD] REJECT 401 uuid={fmt_uuid(client_uuid)} ip={ip} reason={auth_reason}")
+        log_info(f"[UPLOAD] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
         return web.json_response({"error": "Unauthorized. Please login."}, status=401)
         
     if request.content_length and request.content_length > MAX_AVATAR_SIZE:
@@ -529,16 +758,8 @@ async def upload_avatar(request):
 
     hash_cache[client_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
     users_with_avatars.add(client_uuid)
-    watchers = len(subscriptions.get(client_uuid, ()))
-    log_info(f"[UPLOAD] OK uuid={fmt_uuid(client_uuid)} ip={ip} bytes={bytes_written} watchers={watchers}")
-
-    if client_uuid in subscriptions:
-        uuid_bytes = uuid.UUID(client_uuid).bytes
-        event_packet = b'\x02' + uuid_bytes
-        for sub_uuid in subscriptions[client_uuid]:
-            if sub_uuid != client_uuid and sub_uuid in active_connections:
-                await active_connections[sub_uuid].send_bytes(event_packet)
-                log_debug(f"[EVENT-OUT] Skin update -> {sub_uuid}")
+    watchers = await notify_avatar_update(ident, "Skin update")
+    log_info(f"[UPLOAD] OK {user_tag(client_uuid)} bytes={bytes_written} watchers={watchers} ip={ip}")
 
     return web.json_response({"status": "success"})
 
@@ -548,15 +769,18 @@ async def equip_avatar(request):
 async def delete_avatar(request):
     ip = request['real_ip']
     raw_token = request.headers.get('token', '')
-    client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
+    client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
     
     if not is_valid_uuid(client_uuid):
         log_warn(f"[DELETE] REJECT 400 ip={ip} reason=invalid-token-uuid value={shown(client_uuid)}")
         return web.json_response({"error": "Invalid token"}, status=400)
-        
+
+    username, _ = resolve_client_identity(request, client_uuid)
+    ident = username or client_uuid
+
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[DELETE] REJECT 401 uuid={fmt_uuid(client_uuid)} ip={ip} reason={auth_reason}")
+        log_info(f"[DELETE] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
         return web.json_response({"error": "Unauthorized. Please login."}, status=401)
 
     file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
@@ -564,17 +788,10 @@ async def delete_avatar(request):
         await asyncio.to_thread(os.remove, file_path)
         users_with_avatars.discard(client_uuid)
         hash_cache.pop(client_uuid, None)
-        log_info(f"[DELETE] OK uuid={fmt_uuid(client_uuid)} ip={ip}")
-        
-        if client_uuid in subscriptions:
-            uuid_bytes = uuid.UUID(client_uuid).bytes
-            event_packet = b'\x02' + uuid_bytes
-            for sub_uuid in subscriptions[client_uuid]:
-                if sub_uuid != client_uuid and sub_uuid in active_connections:
-                    await active_connections[sub_uuid].send_bytes(event_packet)
-                    log_debug(f"[EVENT-OUT] Skin deletion -> {sub_uuid}")
+        watchers = await notify_avatar_update(ident, "Skin deletion")
+        log_info(f"[DELETE] OK {user_tag(client_uuid)} watchers={watchers} ip={ip}")
     else:
-        log_info(f"[DELETE] uuid={fmt_uuid(client_uuid)} ip={ip} nothing to delete (no avatar stored)")
+        log_info(f"[DELETE] {user_tag(client_uuid)} ip={ip} nothing to delete (no avatar stored)")
                         
     return web.json_response({"status": "deleted"})
 
@@ -591,7 +808,7 @@ async def websocket_handler(request):
         await ws.prepare(request)
         
         raw_token = request.headers.get('token', '')
-        client_uuid = raw_token.split(':')[0] if ':' in raw_token else raw_token
+        client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
         
         if not is_valid_uuid(client_uuid):
             reason = "no-token-header" if not raw_token else "malformed-uuid"
@@ -599,6 +816,29 @@ async def websocket_handler(request):
             return ws
             
         is_authenticated, auth_reason = auth_status(request, client_uuid)
+
+        username, session_uuid = resolve_client_identity(request, client_uuid)
+        ident = username or client_uuid
+        tag = user_tag(client_uuid)
+        addon_version = clean_version(request.headers.get('addon-version'))
+        version_status = addon_version_status(addon_version)
+
+        if REQUIRE_AUTH and not is_authenticated and active_auth.get(ident) and ident in active_connections:
+            log_warn(f"[WS] REJECT {tag} ip={real_ip} reason=authenticated-session-online (an unauthenticated connection cannot replace it)")
+            return ws
+
+        session_note = ""
+        registered_session = None
+        if username and session_uuid and session_uuid != client_uuid:
+            if is_authenticated:
+                ok, why = register_session_alias(username, session_uuid)
+                if ok:
+                    registered_session = session_uuid
+                    session_note = f" (session_uuid={session_uuid})"
+                else:
+                    session_note = f" (session_uuid={session_uuid} REJECTED: {why})"
+            else:
+                session_note = f" (session_uuid={session_uuid} ignored: not authenticated)"
 
         file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
         has_avatar = os.path.exists(file_path)
@@ -611,11 +851,12 @@ async def websocket_handler(request):
         if REQUIRE_AUTH and not is_authenticated:
             is_registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
 
-        previous = active_connections.get(client_uuid)
+        previous = active_connections.get(ident)
         if previous is not None and previous is not ws:
-            log_warn(f"[WS] duplicate session uuid={fmt_uuid(client_uuid)} ip={real_ip}: an older connection with this UUID is still registered and is being replaced")
+            log_warn(f"[WS] duplicate session {tag} ip={real_ip}: an older connection of this player is still registered and is being replaced")
 
-        active_connections[client_uuid] = ws
+        active_connections[ident] = ws
+        active_auth[ident] = bool(is_authenticated)
         connected_at = time.time()
 
         if not REQUIRE_AUTH:
@@ -624,7 +865,8 @@ async def websocket_handler(request):
             auth_text = "yes"
         else:
             auth_text = f"NO reason={auth_reason} registered={'yes' if is_registered else 'no'}"
-        log_info(f"[WS] + connect uuid={fmt_uuid(client_uuid)} ip={real_ip} auth={auth_text} avatar={'yes' if has_avatar else 'no'} online={len(active_connections)}")
+        version_text = f"v{addon_version}" if addon_version else "no-addon-version"
+        log_info(f"[WS] + connect username={username or '?'} canonical_uuid={client_uuid}{session_note}  {version_text} ip={real_ip} auth={auth_text} avatar={'yes' if has_avatar else 'no'} online={len(active_connections)}")
         
         ping_bytes_sec = 0
         ping_reset_time = time.time()
@@ -639,7 +881,7 @@ async def websocket_handler(request):
         def note_drop(kind, reason, detail=""):
             drops[reason] = drops.get(reason, 0) + 1
             if drops[reason] == 1:
-                log_warn(f"[WS] dropped {kind} uuid={fmt_uuid(client_uuid)} ip={real_ip} reason={reason} {detail} (further drops this session are only counted)")
+                log_warn(f"[WS] dropped {kind} {tag} ip={real_ip} reason={reason} {detail} (further drops this session are only counted)")
         
         try:
             await ws.send_bytes(b'\x00')
@@ -656,10 +898,15 @@ async def websocket_handler(request):
                     toast_packet = b'\x03\x00' + "Authenticated".encode('utf-8') + b'\x00' + "Connected successfully.".encode('utf-8')
                     await ws.send_bytes(toast_packet)
 
-            # TEMPORARY: remove this whole block once old addon versions (they send v4 UUIDs) are no longer in use
-            if uuid.UUID(client_uuid).version == 4:
-                warn_packet = b'\x03\x01' + "Outdated version of Figura Unchained".encode('utf-8') + b'\x00' + "Please update your version on Modrinth".encode('utf-8')
-                await ws.send_bytes(warn_packet)
+            if version_status != "ok":
+                log_warn(f"[WS] addon update needed {tag} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW})")
+                await ws.send_bytes(UPDATE_TOAST_PACKET)
+
+            if registered_session and has_avatar:
+                for watcher in list(subscriptions.get(registered_session, ())):
+                    watcher_ws = active_connections.get(watcher)
+                    if watcher != ident and watcher_ws is not None:
+                        await safe_send(watcher_ws, b'\x02' + uuid.UUID(registered_session).bytes)
             
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -680,7 +927,7 @@ async def websocket_handler(request):
                         continue
                     
                     if cmd == 0:
-                        log_debug(f"[WS-TOKEN] Ignored token packet from {client_uuid}")
+                        log_debug(f"[WS-TOKEN] Ignored token packet from {display_name(ident)}")
                         
                     elif cmd == 1:
                         pings_in += 1
@@ -691,7 +938,7 @@ async def websocket_handler(request):
                             continue
 
                         if client_uuid not in users_with_avatars:
-                            note_drop("ping", "no-avatar-uploaded", "(pings are relayed only for UUIDs that have an uploaded avatar)")
+                            note_drop("ping", "no-avatar-uploaded", "(pings are relayed only for players that have an uploaded avatar)")
                             continue
                             
                         if len(data) > MAX_PING_SIZE:
@@ -709,64 +956,66 @@ async def websocket_handler(request):
                             await ws.send_bytes(b'\x05\x01')
                             continue
 
-                        uuid_bytes = uuid.UUID(client_uuid).bytes
-                        s2c_packet = data[0:1] + uuid_bytes + data[1:]
-                        
                         recipients = []
-                        if client_uuid in subscriptions:
-                            for sub_uuid in subscriptions[client_uuid]:
-                                if sub_uuid != client_uuid and sub_uuid in active_connections:
-                                    await active_connections[sub_uuid].send_bytes(s2c_packet)
-                                    recipients.append(short_uuid(sub_uuid))
+                        for watcher, target_uuid in get_watchers_for_user(ident).items():
+                            watcher_ws = active_connections.get(watcher)
+                            if watcher_ws is None:
+                                continue
+                            s2c_packet = data[0:1] + uuid.UUID(target_uuid).bytes + data[1:]
+                            if await safe_send(watcher_ws, s2c_packet):
+                                recipients.append(display_name(watcher))
                         pings_relayed += 1
-                        log_debug(f"[WS-PING] {short_uuid(client_uuid)} size={len(data)} -> {', '.join(recipients) if recipients else 'nobody'}")
+                        log_debug(f"[WS-PING] {display_name(ident)} size={len(data)} -> {', '.join(recipients) if recipients else 'nobody'}")
                     
                     elif cmd == 2 and len(data) >= 17:
                         if client_subs >= WS_MAX_SUBS_PER_CLIENT:
                             note_drop("subscribe", "subscription-limit", f"limit={WS_MAX_SUBS_PER_CLIENT}")
                             continue
                         target_uuid = str(uuid.UUID(bytes=data[1:17]))
-                        if target_uuid not in subscriptions:
-                            subscriptions[target_uuid] = set()
-                        if client_uuid not in subscriptions[target_uuid]:
-                            subscriptions[target_uuid].add(client_uuid)
+                        watchers_of_target = subscriptions.setdefault(target_uuid, set())
+                        if ident not in watchers_of_target:
+                            watchers_of_target.add(ident)
                             client_subs += 1
-                        log_debug(f"[WS-SUB] {short_uuid(client_uuid)} -> {short_uuid(target_uuid)}")
-                        
-                        uuid_bytes = uuid.UUID(target_uuid).bytes
-                        event_packet = b'\x02' + uuid_bytes
-                        await ws.send_bytes(event_packet)
+                        log_debug(f"[WS-SUB] {display_name(ident)} -> {display_name(target_uuid)}")
+
+                        if resolve_canonical(target_uuid) in users_with_avatars:
+                            await ws.send_bytes(b'\x02' + uuid.UUID(target_uuid).bytes)
                     
                     elif cmd == 3 and len(data) >= 17:
                         target_uuid = str(uuid.UUID(bytes=data[1:17]))
-                        if target_uuid in subscriptions and client_uuid in subscriptions[target_uuid]:
-                            subscriptions[target_uuid].remove(client_uuid)
+                        if ident in subscriptions.get(target_uuid, ()):
+                            subscriptions[target_uuid].remove(ident)
                             client_subs -= 1
-                            log_debug(f"[WS-UNSUB] {short_uuid(client_uuid)} -/-> {short_uuid(target_uuid)}")
+                            if not subscriptions[target_uuid]:
+                                del subscriptions[target_uuid]
+                            log_debug(f"[WS-UNSUB] {display_name(ident)} -/-> {display_name(target_uuid)}")
                     
                 elif msg.type == WSMsgType.ERROR:
-                    log_warn(f"[WS] error uuid={fmt_uuid(client_uuid)} ip={real_ip}: {ws.exception()!r}")
+                    log_warn(f"[WS] error {tag} ip={real_ip}: {ws.exception()!r}")
         except ConnectionError as e:
-            log_info(f"[WS] connection lost uuid={fmt_uuid(client_uuid)} ip={real_ip}: {e!r}")
+            log_info(f"[WS] connection lost {tag} ip={real_ip}: {e!r}")
         except Exception:
-            logging.exception(f"[WS] Unhandled error in session uuid={fmt_uuid(client_uuid)} ip={real_ip}")
+            logging.exception(f"[WS] Unhandled error in session {tag} ip={real_ip}")
         finally:
-            current = active_connections.get(client_uuid)
+            current = active_connections.get(ident)
             replaced = current is not None and current is not ws
             if current is ws:
-                del active_connections[client_uuid]
+                del active_connections[ident]
+                active_auth.pop(ident, None)
             
             if not replaced:
                 for target in list(subscriptions.keys()):
-                    if client_uuid in subscriptions[target]:
-                        subscriptions[target].remove(client_uuid)
+                    if ident in subscriptions[target]:
+                        subscriptions[target].remove(ident)
                         if not subscriptions[target]:
                             del subscriptions[target]
+                if registered_session and user_session_uuids.get(username) == registered_session:
+                    drop_session_alias(username)
                         
             drops_text = ", ".join(f"{k}={v}" for k, v in drops.items()) or "none"
-            log_info(f"[WS] - disconnect uuid={fmt_uuid(client_uuid)} ip={real_ip} time={fmt_dur(time.time() - connected_at)} code={ws.close_code} pings={pings_in} relayed={pings_relayed} drops={drops_text} subs={client_subs} online={len(active_connections)}")
+            log_info(f"[WS] - disconnect {tag} ip={real_ip} time={fmt_dur(time.time() - connected_at)} code={ws.close_code} pings={pings_in} relayed={pings_relayed} drops={drops_text} subs={client_subs} online={len(active_connections)}")
             if replaced:
-                log_info(f"[WS] uuid={fmt_uuid(client_uuid)}: closed connection had already been replaced by a newer one; the newer session was left untouched")
+                log_info(f"[WS] {tag}: closed connection had already been replaced by a newer one; the newer session was left untouched")
     finally:
         ip_connections[real_ip] -= 1
         if ip_connections[real_ip] <= 0:
@@ -892,6 +1141,7 @@ def log_startup_summary():
     with db_lock:
         users = db_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     avatars = len(glob.glob(os.path.join(AVATAR_DIR, "*.nbt")))
+    log_info(f"[SYS] Identity: usernames_known={len(user_canonical_uuids)} min_addon_version={MIN_ADDON_VERSION_RAW}")
     log_info(f"[SYS] Starting on {HOST}:{PORT} | debug={DEBUG} require_auth={REQUIRE_AUTH} | registered_users={users} avatars={avatars}")
     log_info(f"[SYS] Limits: avatar={MAX_AVATAR_SIZE}B (unpacked {MAX_AVATAR_UNPACKED_SIZE}B), ping={MAX_PING_SIZE}B/{MAX_PING_BPS}Bps | http={RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s, auth={LOGIN_RATE_LIMIT_REQUESTS}/{LOGIN_RATE_LIMIT_WINDOW}s | ws: {WS_MAX_CONNECTIONS_PER_IP} conn/ip, {WS_MAX_MESSAGES_PER_SEC} msg/s, {WS_MAX_SUBS_PER_CLIENT} subs | trusted_proxies={len(trusted_networks)}")
 
