@@ -132,10 +132,21 @@ def save_secure_file(path, content):
         f.write(content)
 
 db_conn = sqlite3.connect('data/users.db', check_same_thread=False)
-db_conn.execute('CREATE TABLE IF NOT EXISTS users (uuid TEXT PRIMARY KEY, username TEXT, password_hash TEXT, last_ip TEXT)')
-if 'username' not in [row[1] for row in db_conn.execute("PRAGMA table_info(users)")]:
-    db_conn.execute('ALTER TABLE users ADD COLUMN username TEXT')
+db_conn.execute('CREATE TABLE IF NOT EXISTS users (username TEXT, uuid TEXT PRIMARY KEY, password_hash TEXT, last_ip TEXT)')
 db_conn.commit()
+users_columns = [row[1] for row in db_conn.execute("PRAGMA table_info(users)")]
+if users_columns[:1] != ['username']:
+    username_source = 'username' if 'username' in users_columns else 'NULL'
+    try:
+        db_conn.execute('BEGIN')
+        db_conn.execute('CREATE TABLE users_new (username TEXT, uuid TEXT PRIMARY KEY, password_hash TEXT, last_ip TEXT)')
+        db_conn.execute(f'INSERT INTO users_new (username, uuid, password_hash, last_ip) SELECT {username_source}, uuid, password_hash, last_ip FROM users')
+        db_conn.execute('DROP TABLE users')
+        db_conn.execute('ALTER TABLE users_new RENAME TO users')
+        db_conn.commit()
+    except Exception:
+        db_conn.rollback()
+        raise
 db_lock = threading.Lock()
 
 ADMIN_SESSION_TOKEN = secrets.token_hex(32)
