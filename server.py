@@ -324,11 +324,11 @@ def aliases_of(ident):
         result.append(session)
     return result
 
-def get_watchers_for_user(ident):
+def get_watchers_for_user(ident, include_self=False):
     watchers = {}
     for alias in aliases_of(ident):
         for watcher in subscriptions.get(alias, ()):
-            if watcher != ident and watcher not in watchers:
+            if (include_self or watcher != ident) and watcher not in watchers:
                 watchers[watcher] = alias
     return watchers
 
@@ -388,13 +388,13 @@ async def safe_send(ws, packet):
         log_debug(f"[WS] send failed: {e!r}")
         return False
 
-async def notify_avatar_update(ident, reason):
-    watchers = get_watchers_for_user(ident)
+async def notify_avatar_update(ident, reason, include_self=False):
+    watchers = get_watchers_for_user(ident, include_self)
     for watcher, alias in watchers.items():
         target_ws = active_connections.get(watcher)
         if target_ws is not None and await safe_send(target_ws, b'\x02' + uuid.UUID(alias).bytes):
             log_debug(f"[EVENT-OUT] {reason} {display_name(ident)} -> {display_name(watcher)}")
-    return len(watchers)
+    return len(watchers) - (1 if include_self and ident in watchers else 0)
 
 def get_file_hash_sync(filepath):
     hasher = hashlib.sha256()
@@ -1382,7 +1382,7 @@ async def set_badge(request):
     else:
         user_badges[client_uuid] = badge
 
-    watchers = await notify_avatar_update(ident, "Badge update")
+    watchers = await notify_avatar_update(ident, "Badge update", include_self=True)
     action = "CLEAR" if badge is None else f"SET badge={badge}"
     log_info(f"[BADGE] {action} {user_tag(client_uuid)} watchers={watchers} ip={ip}")
     return web.json_response({"status": "success"})
