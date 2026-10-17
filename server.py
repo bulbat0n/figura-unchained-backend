@@ -16,10 +16,13 @@ import logging
 import json
 import glob
 import zlib
+import shutil
+import tempfile
+import zipfile
 from urllib.parse import unquote_plus
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,7 +34,9 @@ REQUIRED_VARS = [
     "RATE_LIMIT_CLEANUP_INTERVAL", "WS_MAX_CONNECTIONS_PER_IP",
     "WS_MAX_MESSAGES_PER_SEC", "WS_MAX_SUBS_PER_CLIENT",
     "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW",
-    "MAX_AVATAR_UNPACKED_SIZE", "MIN_ADDON_VERSION"
+    "MAX_AVATAR_UNPACKED_SIZE", "MIN_ADDON_VERSION",
+    "ASSETS_UPDATE_INTERVAL_HOURS", "ASSETS_RATE_LIMIT_REQUESTS",
+    "ASSETS_RATE_LIMIT_WINDOW", "MAX_PRIDE_BADGE_ID"
 ]
 
 missing_vars = [var for var in REQUIRED_VARS if not os.environ.get(var)]
@@ -105,6 +110,28 @@ MIN_ADDON_VERSION = parse_addon_version(MIN_ADDON_VERSION_RAW)
 if MIN_ADDON_VERSION is None:
     config_errors.append(f"MIN_ADDON_VERSION must look like '1.9.3', got '{MIN_ADDON_VERSION_RAW}'")
 
+try:
+    ASSETS_UPDATE_INTERVAL_HOURS = int(os.environ.get("ASSETS_UPDATE_INTERVAL_HOURS"))
+    ASSETS_RATE_LIMIT_REQUESTS = int(os.environ.get("ASSETS_RATE_LIMIT_REQUESTS"))
+    ASSETS_RATE_LIMIT_WINDOW = int(os.environ.get("ASSETS_RATE_LIMIT_WINDOW"))
+    MAX_PRIDE_BADGE_ID = int(os.environ.get("MAX_PRIDE_BADGE_ID"))
+    if ASSETS_UPDATE_INTERVAL_HOURS < 0:
+        config_errors.append("ASSETS_UPDATE_INTERVAL_HOURS must be 0 (updates disabled) or a positive number of hours.")
+    if ASSETS_RATE_LIMIT_REQUESTS < 1 or ASSETS_RATE_LIMIT_WINDOW < 1:
+        config_errors.append("ASSETS_RATE_LIMIT_REQUESTS and ASSETS_RATE_LIMIT_WINDOW must be at least 1.")
+    if not 0 <= MAX_PRIDE_BADGE_ID <= 255:
+        config_errors.append("MAX_PRIDE_BADGE_ID must be between 0 and 255.")
+except ValueError:
+    config_errors.append("Assets and badge settings must be integers.")
+
+ASSETS_REPO = os.environ.get("ASSETS_REPO", "").strip() or "FiguraMC/Assets"
+ASSETS_REF = os.environ.get("ASSETS_REF", "").strip() or "main"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+if not re.match(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$', ASSETS_REPO):
+    config_errors.append(f"ASSETS_REPO must look like 'owner/name', got '{ASSETS_REPO}'")
+if not re.match(r'^[A-Za-z0-9_./-]{1,100}$', ASSETS_REF) or '..' in ASSETS_REF:
+    config_errors.append(f"ASSETS_REF is not a valid branch, tag or commit: '{ASSETS_REF}'")
+
 if config_errors:
     print("[FATAL ERROR] .env syntax/value errors found:")
     for err in config_errors:
@@ -147,6 +174,8 @@ if users_columns[:1] != ['username']:
     except Exception:
         db_conn.rollback()
         raise
+db_conn.execute('CREATE TABLE IF NOT EXISTS user_badges (uuid TEXT PRIMARY KEY, badge INTEGER NOT NULL)')
+db_conn.commit()
 db_lock = threading.Lock()
 
 ADMIN_SESSION_TOKEN = secrets.token_hex(32)
@@ -476,6 +505,10 @@ auth_rate_limits = {}
 AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
 WS_PATHS = ('/ws', '/api/ws', '/api//ws')
 VERSION_EXEMPT_PATHS = ('/api', '/api/', '/api/version', '/api/limits', '/api/motd')
+ASSET_REQUEST_RE = re.compile(r'^(?:/api/?)?/assets/(v\d+)(?:/(.*))?$')
+assets_rate_limits = {}
+user_badges = {}
+assets_snapshot = None
 seen_http_clients = set()
 
 def init_identity_state():
@@ -506,22 +539,291 @@ def note_http_client(request, real_ip):
     else:
         log_warn(f"[HTTP] client {who} addon-version={version or 'none'} status={status} (minimum {MIN_ADDON_VERSION_RAW})")
 
+ASSETS_ROOT = os.path.join("data", "assets")
+ASSETS_CURRENT_FILE = os.path.join(ASSETS_ROOT, "CURRENT")
+ASSETS_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+ASSETS_VERSION_RE = re.compile(r'^v\d+$')
+AVATAR_ID_RE = re.compile(r'^[0-9a-fA-F\-]{36}$')
+ASSETS_SEGMENT_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]*$')
+ASSETS_MAX_ZIP_BYTES = 64 * 1024 * 1024
+ASSETS_MAX_FILE_BYTES = 16 * 1024 * 1024
+ASSETS_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+ASSETS_MAX_ENTRIES = 20000
+ASSETS_MAX_FILES = 5000
+ASSETS_RETRY_SECONDS = 900
+os.makedirs(ASSETS_ROOT, exist_ok=True)
+
+def is_asset_request(path):
+    match = ASSET_REQUEST_RE.match(path)
+    if not match:
+        return False
+    rest = match.group(2)
+    return not (rest and AVATAR_ID_RE.match(rest))
+
+def is_safe_asset_relpath(rel):
+    return bool(rel) and all(ASSETS_SEGMENT_RE.match(part) for part in rel.split('/'))
+
+def hash_asset_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def build_assets_indexes(directory):
+    indexes = {}
+    skipped = []
+    for version in sorted(os.listdir(directory)):
+        version_dir = os.path.join(directory, version)
+        if not ASSETS_VERSION_RE.match(version) or os.path.islink(version_dir) or not os.path.isdir(version_dir):
+            continue
+        index = {}
+        for root, dirs, files in os.walk(version_dir):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, version_dir).replace(os.sep, '/')
+                if os.path.islink(full) or not is_safe_asset_relpath(rel):
+                    skipped.append(f"{version}/{rel}")
+                    continue
+                index[rel] = hash_asset_file(full)
+        indexes[version] = index
+    return indexes, skipped
+
+def make_assets_snapshot(commit, directory, indexes):
+    return {
+        "commit": commit,
+        "directory": directory,
+        "indexes": indexes,
+        "index_json": {version: json.dumps(index, separators=(',', ':')).encode('utf-8') for version, index in indexes.items()},
+    }
+
+def extract_assets_zip(zip_path, target_dir):
+    skipped = []
+    files = 0
+    total = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = zf.infolist()
+        if len(infos) > ASSETS_MAX_ENTRIES:
+            raise ValueError("archive has too many entries")
+        roots = {info.filename.split('/', 1)[0] for info in infos}
+        if len(roots) != 1:
+            raise ValueError("unexpected archive layout")
+        target_real = os.path.realpath(target_dir)
+        for info in infos:
+            name = info.filename
+            if '\\' in name or name.startswith('/'):
+                skipped.append(name)
+                continue
+            parts = name.split('/')[1:]
+            if not parts or not parts[-1] or info.is_dir():
+                continue
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                continue
+            is_license = parts == ['LICENSE']
+            is_asset = len(parts) >= 2 and ASSETS_VERSION_RE.match(parts[0]) is not None
+            if not (is_license or is_asset):
+                continue
+            if not is_safe_asset_relpath('/'.join(parts)):
+                skipped.append('/'.join(parts))
+                continue
+            if info.file_size > ASSETS_MAX_FILE_BYTES:
+                raise ValueError(f"{name} is too large")
+            files += 1
+            total += info.file_size
+            if files > ASSETS_MAX_FILES or total > ASSETS_MAX_TOTAL_BYTES:
+                raise ValueError("archive is too large")
+            destination = os.path.join(target_dir, *parts)
+            if os.path.commonpath([target_real, os.path.realpath(destination)]) != target_real:
+                raise ValueError(f"{name} points outside of the target directory")
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with zf.open(info) as source, open(destination, 'xb') as target:
+                shutil.copyfileobj(source, target, 65536)
+    return skipped
+
+def prune_assets_dir(keep):
+    for name in os.listdir(ASSETS_ROOT):
+        path = os.path.join(ASSETS_ROOT, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        if name.startswith('.staging-') or (ASSETS_SHA_RE.match(name) and name not in keep):
+            shutil.rmtree(path, ignore_errors=True)
+
+def publish_assets_snapshot(commit, staging_dir):
+    if not ASSETS_SHA_RE.match(commit):
+        raise ValueError("invalid commit id")
+    indexes, _ = build_assets_indexes(staging_dir)
+    if not any(indexes.values()):
+        raise ValueError("snapshot contains no asset files")
+    final_dir = os.path.join(ASSETS_ROOT, commit)
+    if os.path.isdir(final_dir):
+        shutil.rmtree(final_dir)
+    os.replace(staging_dir, final_dir)
+    temporary = ASSETS_CURRENT_FILE + ".tmp"
+    with open(temporary, 'w', encoding='utf-8') as f:
+        f.write(commit)
+    os.replace(temporary, ASSETS_CURRENT_FILE)
+    return make_assets_snapshot(commit, final_dir, indexes)
+
+def load_current_assets_snapshot():
+    try:
+        with open(ASSETS_CURRENT_FILE, encoding='utf-8') as f:
+            commit = f.read().strip()
+    except OSError:
+        return None
+    if not ASSETS_SHA_RE.match(commit):
+        return None
+    directory = os.path.join(ASSETS_ROOT, commit)
+    if not os.path.isdir(directory):
+        return None
+    indexes, _ = build_assets_indexes(directory)
+    if not any(indexes.values()):
+        return None
+    return make_assets_snapshot(commit, directory, indexes)
+
+def assets_request_headers(accept, with_token=False):
+    headers = {"Accept": accept, "User-Agent": "figura-unchained-backend"}
+    if with_token and GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+async def fetch_latest_assets_commit(session):
+    url = f"https://api.github.com/repos/{ASSETS_REPO}/commits/{ASSETS_REF}"
+    async with session.get(url, headers=assets_request_headers("application/vnd.github.sha", True)) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"GitHub API answered {resp.status}")
+        data = b''
+        async for chunk in resp.content.iter_chunked(1024):
+            data += chunk
+            if len(data) > 1024:
+                raise RuntimeError("unexpected GitHub API response")
+    commit = data.decode('ascii', errors='replace').strip().lower()
+    if not ASSETS_SHA_RE.match(commit):
+        raise RuntimeError("GitHub API returned an invalid commit id")
+    return commit
+
+async def download_assets_archive(session, commit, destination):
+    url = f"https://codeload.github.com/{ASSETS_REPO}/zip/{commit}"
+    async with session.get(url, headers=assets_request_headers("application/zip")) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"archive download answered {resp.status}")
+        received = 0
+        with open(destination, 'wb') as out:
+            async for chunk in resp.content.iter_chunked(65536):
+                received += len(chunk)
+                if received > ASSETS_MAX_ZIP_BYTES:
+                    raise RuntimeError("archive is too large")
+                await asyncio.to_thread(out.write, chunk)
+
+async def sync_assets_once():
+    global assets_snapshot
+    async with ClientSession(timeout=ClientTimeout(total=300, connect=15)) as session:
+        commit = await fetch_latest_assets_commit(session)
+        previous = assets_snapshot
+        if previous is not None and previous["commit"] == commit:
+            log_debug(f"[ASSETS] already up to date commit={commit[:7]}")
+            return
+        staging = await asyncio.to_thread(tempfile.mkdtemp, prefix=".staging-", dir=ASSETS_ROOT)
+        try:
+            archive_path = os.path.join(staging, "download.zip")
+            content_dir = os.path.join(staging, "content")
+            os.mkdir(content_dir)
+            await download_assets_archive(session, commit, archive_path)
+            skipped = await asyncio.to_thread(extract_assets_zip, archive_path, content_dir)
+            snapshot = await asyncio.to_thread(publish_assets_snapshot, commit, content_dir)
+        finally:
+            await asyncio.to_thread(shutil.rmtree, staging, True)
+    assets_snapshot = snapshot
+    keep = {commit}
+    if previous is not None:
+        keep.add(previous["commit"])
+    await asyncio.to_thread(prune_assets_dir, keep)
+    counts = ", ".join(f"{version}={len(index)}" for version, index in snapshot["indexes"].items())
+    log_info(f"[ASSETS] updated to commit={commit[:7]} files: {counts}" + (f" | skipped (unsupported names): {', '.join(skipped[:5])}" if skipped else ""))
+
+async def assets_sync_loop(app):
+    global assets_snapshot
+    await asyncio.to_thread(prune_assets_dir, set())
+    assets_snapshot = await asyncio.to_thread(load_current_assets_snapshot)
+    if assets_snapshot is not None:
+        counts = ", ".join(f"{version}={len(index)}" for version, index in assets_snapshot["indexes"].items())
+        log_info(f"[ASSETS] loaded commit={assets_snapshot['commit'][:7]} files: {counts}")
+    if ASSETS_UPDATE_INTERVAL_HOURS <= 0:
+        log_info("[ASSETS] automatic updates are disabled (ASSETS_UPDATE_INTERVAL_HOURS=0)")
+        return
+    interval = ASSETS_UPDATE_INTERVAL_HOURS * 3600
+    while True:
+        delay = interval
+        try:
+            await sync_assets_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            delay = min(interval, ASSETS_RETRY_SECONDS)
+            log_warn(f"[ASSETS] update failed, keeping the current files: {e!r}")
+        await asyncio.sleep(delay)
+
+def load_badges():
+    with db_lock:
+        rows = db_conn.execute("SELECT uuid, badge FROM user_badges").fetchall()
+    for stored_uuid, badge in rows:
+        if is_valid_uuid(stored_uuid) and isinstance(badge, int) and 0 <= badge <= MAX_PRIDE_BADGE_ID:
+            user_badges[stored_uuid] = badge
+
+def db_set_badge_sync(client_uuid, badge):
+    with db_lock:
+        if badge is None:
+            db_conn.execute("DELETE FROM user_badges WHERE uuid = ?", (client_uuid,))
+        else:
+            db_conn.execute("INSERT OR REPLACE INTO user_badges (uuid, badge) VALUES (?, ?)", (client_uuid, badge))
+        db_conn.commit()
+
+def parse_badge_body(body):
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False, None
+    if value is None:
+        return True, None
+    if type(value) is int and 0 <= value <= MAX_PRIDE_BADGE_ID:
+        return True, value
+    return False, None
+
+def pride_badges_for(target_uuid):
+    badge = user_badges.get(target_uuid)
+    if badge is None or not 0 <= badge <= MAX_PRIDE_BADGE_ID:
+        return []
+    return [0] * badge + [1]
+
+load_badges()
+
 @web.middleware
 async def security_middleware(request, handler):
     real_ip = get_real_ip(request)
     request['real_ip'] = real_ip
     
     current_time = time.time()
-    if real_ip not in rate_limits:
-        rate_limits[real_ip] = {"count": 0, "reset": current_time + RATE_LIMIT_WINDOW}
-        
-    if current_time > rate_limits[real_ip]["reset"]:
-        rate_limits[real_ip] = {"count": 1, "reset": current_time + RATE_LIMIT_WINDOW}
+    asset_request = is_asset_request(request.path)
+
+    if asset_request:
+        asset_entry = assets_rate_limits.get(real_ip)
+        if asset_entry is None or current_time > asset_entry["reset"]:
+            asset_entry = assets_rate_limits[real_ip] = {"count": 0, "reset": current_time + ASSETS_RATE_LIMIT_WINDOW}
+        asset_entry["count"] += 1
+        if asset_entry["count"] > ASSETS_RATE_LIMIT_REQUESTS:
+            log_throttled(f"assetrate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {ASSETS_RATE_LIMIT_REQUESTS} asset requests per {ASSETS_RATE_LIMIT_WINDOW}s (last: {request.method} {request.path!r})")
+            return web.Response(status=429, headers={"Retry-After": str(max(1, int(asset_entry["reset"] - current_time) + 1))})
     else:
-        rate_limits[real_ip]["count"] += 1
-        if rate_limits[real_ip]["count"] > RATE_LIMIT_REQUESTS:
-            log_throttled(f"rate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s (last: {request.method} {request.path!r})")
-            return web.json_response({"error": "Too Many Requests"}, status=429)
+        if real_ip not in rate_limits:
+            rate_limits[real_ip] = {"count": 0, "reset": current_time + RATE_LIMIT_WINDOW}
+
+        if current_time > rate_limits[real_ip]["reset"]:
+            rate_limits[real_ip] = {"count": 1, "reset": current_time + RATE_LIMIT_WINDOW}
+        else:
+            rate_limits[real_ip]["count"] += 1
+            if rate_limits[real_ip]["count"] > RATE_LIMIT_REQUESTS:
+                log_throttled(f"rate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s (last: {request.method} {request.path!r})")
+                return web.json_response({"error": "Too Many Requests"}, status=429)
 
     if LOGIN_RATE_LIMIT_REQUESTS > 0 and request.method == "POST" and request.path in AUTH_PATHS:
         entry = auth_rate_limits.get(real_ip)
@@ -533,12 +835,12 @@ async def security_middleware(request, handler):
             return web.json_response({"error": "Too Many Requests"}, status=429)
 
     ignore_logs = ['/api/version', '/api/limits', '/api/motd', '/api/', '/api', '/api/auth/register', '/api/auth/login']
-    if request.path not in ignore_logs:
+    if request.path not in ignore_logs and not asset_request:
         log_debug(f"[HTTP] {request.method} {request.path!r} ip={real_ip}")
 
     note_http_client(request, real_ip)
 
-    if (request.path.startswith('/api/') or request.path.startswith('/assets/')) and request.path not in WS_PATHS and request.path not in VERSION_EXEMPT_PATHS:
+    if not asset_request and (request.path.startswith('/api/') or request.path.startswith('/assets/')) and request.path not in WS_PATHS and request.path not in VERSION_EXEMPT_PATHS:
         http_version = clean_version(request.headers.get('addon-version'))
         http_status = addon_version_status(http_version)
         if http_status != "ok":
@@ -659,7 +961,7 @@ async def handle_user_profile(request):
         equipped.append({"owner": requested, "id": "avatar", "hash": hash_cache[target_uuid]})
         log_debug(f"[PROFILER] Serving profile {display_name(requested)} (requested={requested} canonical_uuid={target_uuid})")
 
-    return web.json_response({"equipped": equipped, "equippedBadges": {"pride": [], "special": []}}, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    return web.json_response({"equipped": equipped, "equippedBadges": {"pride": pride_badges_for(target_uuid), "special": []}}, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 async def download_avatar(request):
     requested = os.path.basename(request.match_info['uuid']).lower()
@@ -1045,6 +1347,72 @@ async def websocket_handler(request):
 
     return ws
 
+async def set_badge(request):
+    ip = request['real_ip']
+    raw_token = request.headers.get('token', '')
+    client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
+
+    if not is_valid_uuid(client_uuid):
+        log_warn(f"[BADGE] REJECT 400 ip={ip} reason=invalid-token-uuid value={shown(client_uuid)}")
+        return web.json_response({"error": "Invalid token"}, status=400)
+
+    username, _ = resolve_client_identity(request, client_uuid)
+    ident = username or client_uuid
+
+    authed, auth_reason = auth_status(request, client_uuid)
+    if not authed:
+        log_info(f"[BADGE] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+
+    if request.content_length is None or request.content_length > 16:
+        log_info(f"[BADGE] REJECT 400 {user_tag(client_uuid)} ip={ip} reason=bad-body-size length={request.content_length}")
+        return web.json_response({"error": "Invalid badge"}, status=400)
+
+    ok, badge = parse_badge_body(await request.read())
+    if not ok:
+        log_info(f"[BADGE] REJECT 400 {user_tag(client_uuid)} ip={ip} reason=invalid-badge-id (allowed: null or 0..{MAX_PRIDE_BADGE_ID})")
+        return web.json_response({"error": "Invalid badge"}, status=400)
+
+    if user_badges.get(client_uuid) == badge:
+        return web.json_response({"status": "success"})
+
+    await asyncio.to_thread(db_set_badge_sync, client_uuid, badge)
+    if badge is None:
+        user_badges.pop(client_uuid, None)
+    else:
+        user_badges[client_uuid] = badge
+
+    watchers = await notify_avatar_update(ident, "Badge update")
+    action = "CLEAR" if badge is None else f"SET badge={badge}"
+    log_info(f"[BADGE] {action} {user_tag(client_uuid)} watchers={watchers} ip={ip}")
+    return web.json_response({"status": "success"})
+
+ASSET_HEADERS = {"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"}
+
+async def assets_index(request):
+    snapshot = assets_snapshot
+    if snapshot is None:
+        return web.Response(status=503, text="Assets are not available yet", headers={"Retry-After": "60"})
+    body = snapshot["index_json"].get(request.match_info['version'])
+    if body is None:
+        return web.Response(status=404, text="Unknown assets version")
+    log_debug(f"[ASSETS] index {request.match_info['version']} ip={request['real_ip']}")
+    return web.Response(body=body, content_type="application/json", headers=ASSET_HEADERS)
+
+async def assets_file(request):
+    snapshot = assets_snapshot
+    if snapshot is None:
+        return web.Response(status=503, text="Assets are not available yet", headers={"Retry-After": "60"})
+    version = request.match_info['version']
+    relative = request.match_info['path']
+    index = snapshot["indexes"].get(version)
+    if index is None or relative not in index:
+        return web.Response(status=404, text="Not found")
+    full = os.path.join(snapshot["directory"], version, *relative.split('/'))
+    if not os.path.isfile(full):
+        return web.Response(status=404, text="Not found")
+    return web.FileResponse(full, headers=ASSET_HEADERS)
+
 async def cleanup_rate_limits(app):
     while True:
         await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
@@ -1054,6 +1422,8 @@ async def cleanup_rate_limits(app):
             del rate_limits[ip]
         for ip in [ip for ip, d in auth_rate_limits.items() if now > d["reset"]]:
             del auth_rate_limits[ip]
+        for ip in [ip for ip, d in assets_rate_limits.items() if now > d["reset"]]:
+            del assets_rate_limits[ip]
         for key in [k for k, v in throttle_state.items() if now - v[0] > 600]:
             del throttle_state[key]
 
@@ -1123,6 +1493,8 @@ async def start_background_tasks(app):
     app['admin_poller_task'] = asyncio.create_task(admin_command_poller(app), name="admin_command_poller")
     app['cleanup_task'].add_done_callback(log_task_exit)
     app['admin_poller_task'].add_done_callback(log_task_exit)
+    app['assets_task'] = asyncio.create_task(assets_sync_loop(app), name="assets_sync")
+    app['assets_task'].add_done_callback(log_task_exit)
 
 async def cleanup_background_tasks(app):
     app['cleanup_task'].cancel()
@@ -1133,6 +1505,11 @@ async def cleanup_background_tasks(app):
         pass
     try:
         await app['admin_poller_task']
+    except asyncio.CancelledError:
+        pass
+    app['assets_task'].cancel()
+    try:
+        await app['assets_task']
     except asyncio.CancelledError:
         pass
 
@@ -1154,6 +1531,10 @@ app.router.add_get(r'/assets/v2/{uuid:[0-9a-fA-F\-]{36}}', download_avatar)
 app.router.add_get(r'/api/{uuid:[0-9a-fA-F\-]{36}}/avatar', download_avatar)
 app.router.add_put('/api/avatar', upload_avatar)
 app.router.add_post('/api/equip', equip_avatar)
+app.router.add_post('/api/temp_badges', set_badge)
+for assets_prefix in ('/assets', '/api/assets', '/api//assets'):
+    app.router.add_get(assets_prefix + r'/{version:v\d+}', assets_index)
+    app.router.add_get(assets_prefix + r'/{version:v\d+}/{path:.+}', assets_file)
 app.router.add_delete('/api/avatar', delete_avatar)
 app.router.add_get('/ws', websocket_handler)
 app.router.add_get('/api/ws', websocket_handler)
@@ -1163,6 +1544,7 @@ def log_startup_summary():
     with db_lock:
         users = db_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     avatars = len(glob.glob(os.path.join(AVATAR_DIR, "*.nbt")))
+    log_info(f"[SYS] Assets: repo={ASSETS_REPO}@{ASSETS_REF} update_every={ASSETS_UPDATE_INTERVAL_HOURS}h limit={ASSETS_RATE_LIMIT_REQUESTS}/{ASSETS_RATE_LIMIT_WINDOW}s github_token={'set' if GITHUB_TOKEN else 'not set'} | badges max_id={MAX_PRIDE_BADGE_ID} stored={len(user_badges)}")
     log_info(f"[SYS] Identity: usernames_known={len(user_canonical_uuids)} min_addon_version={MIN_ADDON_VERSION_RAW}")
     log_info(f"[SYS] Starting on {HOST}:{PORT} | debug={DEBUG} require_auth={REQUIRE_AUTH} | registered_users={users} avatars={avatars}")
     log_info(f"[SYS] Limits: avatar={MAX_AVATAR_SIZE}B (unpacked {MAX_AVATAR_UNPACKED_SIZE}B), ping={MAX_PING_SIZE}B/{MAX_PING_BPS}Bps | http={RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s, auth={LOGIN_RATE_LIMIT_REQUESTS}/{LOGIN_RATE_LIMIT_WINDOW}s | ws: {WS_MAX_CONNECTIONS_PER_IP} conn/ip, {WS_MAX_MESSAGES_PER_SEC} msg/s, {WS_MAX_SUBS_PER_CLIENT} subs | trusted_proxies={len(trusted_networks)}")
