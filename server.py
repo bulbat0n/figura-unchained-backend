@@ -505,6 +505,7 @@ auth_rate_limits = {}
 AUTH_PATHS = ('/api/auth/register', '/api/auth/login')
 WS_PATHS = ('/ws', '/api/ws', '/api//ws')
 VERSION_EXEMPT_PATHS = ('/api', '/api/', '/api/version', '/api/limits', '/api/motd')
+VANILLA_AUTH_PATHS = ('/api/auth/id', '/api//auth/id', '/api/auth/verify', '/api//auth/verify')
 ASSET_REQUEST_RE = re.compile(r'^(?:/api/?)?/assets/(v\d+)(?:/(.*))?$')
 assets_rate_limits = {}
 user_badges = {}
@@ -845,6 +846,8 @@ async def security_middleware(request, handler):
         http_status = addon_version_status(http_version)
         if http_status != "ok":
             log_throttled(f"oldhttp:{real_ip}", f"[HTTP] REJECT 426 ip={real_ip} {request.method} {request.path!r} addon-version={http_version or 'none'} status={http_status} (minimum {MIN_ADDON_VERSION_RAW})")
+            if http_status != "outdated" and request.path in VANILLA_AUTH_PATHS:
+                return web.Response(status=426, text=f"Please download Figura Unchained. Minimum version for your backend is {MIN_ADDON_VERSION_RAW}", content_type="text/plain")
             return web.json_response({"error": f"Please update Figura Unchained. Minimum version for your backend is {MIN_ADDON_VERSION_RAW}"}, status=426)
 
     try:
