@@ -1142,10 +1142,9 @@ async def websocket_handler(request):
         addon_version = clean_version(request.headers.get('addon-version'))
         version_status = addon_version_status(addon_version)
         if version_status != "ok":
-            log_warn(f"[WS] REJECT {user_tag(client_uuid)} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW}): all requests from this connection are ignored")
+            log_warn(f"[WS] REJECT {user_tag(client_uuid)} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW}): closing connection")
             await safe_send(ws, UPDATE_TOAST_PACKET)
-            async for _ in ws:
-                pass
+            await ws.close(code=4100, message=MIN_ADDON_VERSION_RAW.encode('utf-8'))
             return ws
 
         is_authenticated, auth_reason = auth_status(request, client_uuid)
