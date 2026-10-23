@@ -253,6 +253,7 @@ def fmt_dur(seconds):
 
 uuid_to_username = {}
 user_session_uuids = {}
+user_world_uuids = {}
 user_canonical_uuids = {}
 
 def canonical_uuid_for(username):
@@ -291,8 +292,11 @@ def resolve_canonical(any_uuid):
 def register_known_user(username):
     canonical = canonical_uuid_for(username)
     squatter = uuid_to_username.get(canonical)
-    if squatter is not None and squatter != username and user_session_uuids.get(squatter) == canonical:
-        drop_session_alias(squatter)
+    if squatter is not None and squatter != username:
+        if user_session_uuids.get(squatter) == canonical:
+            drop_session_alias(squatter)
+        if user_world_uuids.get(squatter) == canonical:
+            drop_world_alias(squatter)
     user_canonical_uuids[username] = canonical
     uuid_to_username[canonical] = username
     uuid_to_username[username] = username
@@ -312,9 +316,33 @@ def register_session_alias(username, session_uuid):
         return False, f"already-bound-to {owner}"
     if user_session_uuids.get(username) not in (None, session_uuid):
         drop_session_alias(username)
+    if user_world_uuids.get(username) == session_uuid:
+        drop_world_alias(username)
     user_session_uuids[username] = session_uuid
     uuid_to_username[session_uuid] = username
     return True, "ok"
+
+def drop_world_alias(username):
+    world = user_world_uuids.pop(username, None)
+    if world is not None and uuid_to_username.get(world) == username:
+        del uuid_to_username[world]
+
+def register_world_alias(username, world_uuid):
+    if world_uuid in (user_canonical_uuids.get(username), user_session_uuids.get(username)):
+        drop_world_alias(username)
+        return True, "same-as-known"
+    owner = uuid_to_username.get(world_uuid)
+    if owner is not None and owner != username:
+        return False, f"already-bound-to {owner}"
+    if user_world_uuids.get(username) not in (None, world_uuid):
+        drop_world_alias(username)
+    user_world_uuids[username] = world_uuid
+    uuid_to_username[world_uuid] = username
+    return True, "ok"
+
+def read_world_uuid(request):
+    raw = request.headers.get('client-world-uuid', '').strip().lower()
+    return raw if is_valid_uuid(raw) else None
 
 def aliases_of(ident):
     canonical = user_canonical_uuids.get(ident) or (ident if is_valid_uuid(ident) else None)
@@ -322,6 +350,9 @@ def aliases_of(ident):
     session = user_session_uuids.get(ident)
     if session and session not in result:
         result.append(session)
+    world = user_world_uuids.get(ident)
+    if world and world not in result:
+        result.append(world)
     return result
 
 def get_watchers_for_user(ident, include_self=False):
@@ -1170,6 +1201,16 @@ async def websocket_handler(request):
             else:
                 session_note = f" (session_uuid={session_uuid} ignored: not authenticated)"
 
+        world_uuid = read_world_uuid(request)
+        registered_world = None
+        if username and world_uuid and is_authenticated:
+            ok, why = register_world_alias(username, world_uuid)
+            if ok and why == "ok":
+                registered_world = world_uuid
+                session_note += f" (world_uuid={world_uuid})"
+            elif not ok:
+                session_note += f" (world_uuid={world_uuid} REJECTED: {why})"
+
         file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
         has_avatar = os.path.exists(file_path)
         if has_avatar:
@@ -1228,11 +1269,12 @@ async def websocket_handler(request):
                     toast_packet = b'\x03\x00' + "Authenticated".encode('utf-8') + b'\x00' + "Connected successfully.".encode('utf-8')
                     await ws.send_bytes(toast_packet)
 
-            if registered_session and has_avatar:
-                for watcher in list(subscriptions.get(registered_session, ())):
-                    watcher_ws = active_connections.get(watcher)
-                    if watcher != ident and watcher_ws is not None:
-                        await safe_send(watcher_ws, b'\x02' + uuid.UUID(registered_session).bytes)
+            for alias in (registered_session, registered_world):
+                if alias and has_avatar:
+                    for watcher in list(subscriptions.get(alias, ())):
+                        watcher_ws = active_connections.get(watcher)
+                        if watcher != ident and watcher_ws is not None:
+                            await safe_send(watcher_ws, b'\x02' + uuid.UUID(alias).bytes)
             
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -1337,6 +1379,8 @@ async def websocket_handler(request):
                             del subscriptions[target]
                 if registered_session and user_session_uuids.get(username) == registered_session:
                     drop_session_alias(username)
+                if registered_world and user_world_uuids.get(username) == registered_world:
+                    drop_world_alias(username)
                         
             drops_text = ", ".join(f"{k}={v}" for k, v in drops.items()) or "none"
             log_info(f"[WS] - disconnect {tag} ip={real_ip} time={fmt_dur(time.time() - connected_at)} code={ws.close_code} pings={pings_in} relayed={pings_relayed} drops={drops_text} subs={client_subs} online={len(active_connections)}")
