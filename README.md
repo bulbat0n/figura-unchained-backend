@@ -12,7 +12,7 @@ This is a custom backend for the Figura Unchained addon. It handles custom user 
 ## 📂 Project Structure
 
 * `server.py` — The main backend application.
-* `admin.py` — CLI tool for secure server administration (broadcasts, toasts).
+* `admin.py` — CLI tool for secure server administration (broadcasts, toasts, online list).
 * `data/` — Directory created automatically to store the database, avatars and local session secrets.
 
 ## 🛠️ Setup & Installation
@@ -90,6 +90,8 @@ The server uses a secure, file-based IPC queue for admin commands. You run these
 * Send a GUI toast notification:
   `python3 admin.py toast <type> "Title" "Description"`
   *(Types: 1 = Default, 2 = Warning, 3 = Error, 4 = Cheese)*
+* List connected players with connection details and duration:
+  `python3 admin.py online`
 
 ---
 
