@@ -19,6 +19,7 @@ import zlib
 import shutil
 import tempfile
 import zipfile
+import base64
 from urllib.parse import unquote_plus
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
@@ -142,13 +143,20 @@ os.makedirs("data", exist_ok=True)
 os.makedirs(AVATAR_DIR, exist_ok=True)
 
 log_level = logging.DEBUG if DEBUG else logging.INFO
-log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)-7s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+class OnlineFilter(logging.Filter):
+    def filter(self, record):
+        record.online = len(globals().get('active_connections') or ())
+        return True
+
+log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)-7s][%(online)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 stdout_handler = logging.StreamHandler(sys.stdout)
 stdout_handler.setFormatter(log_formatter)
+stdout_handler.addFilter(OnlineFilter())
 
 file_handler = RotatingFileHandler('data/server.log', maxBytes=5*1024*1024, backupCount=3)
 file_handler.setFormatter(log_formatter)
+file_handler.addFilter(OnlineFilter())
 
 logging.basicConfig(level=log_level, handlers=[stdout_handler, file_handler])
 
@@ -526,6 +534,7 @@ def get_real_ip(request):
     return request.remote
 
 active_connections = {}
+connection_info = {}
 active_auth = {}
 subscriptions = {}
 users_with_avatars = set()
@@ -1237,6 +1246,18 @@ async def websocket_handler(request):
         else:
             auth_text = f"NO reason={auth_reason} registered={'yes' if is_registered else 'no'}"
         version_text = f"v{addon_version}" if addon_version else "no-addon-version"
+        connection_info[ident] = {
+            "username": username or "?",
+            "canonical_uuid": client_uuid,
+            "aliases": session_note.strip(),
+            "version": version_text,
+            "ip": real_ip,
+            "auth": "disabled" if not REQUIRE_AUTH else ("yes" if is_authenticated else "NO"),
+            "reason": auth_reason if REQUIRE_AUTH and not is_authenticated else None,
+            "registered": ("yes" if is_registered else "no") if REQUIRE_AUTH and not is_authenticated else None,
+            "avatar": has_avatar,
+            "connected_at": connected_at,
+        }
         log_info(f"[WS] + connect username={username or '?'} canonical_uuid={client_uuid}{session_note}  {version_text} ip={real_ip} auth={auth_text} avatar={'yes' if has_avatar else 'no'} online={len(active_connections)}")
         
         ping_bytes_sec = 0
@@ -1370,6 +1391,7 @@ async def websocket_handler(request):
             if current is ws:
                 del active_connections[ident]
                 active_auth.pop(ident, None)
+                connection_info.pop(ident, None)
             
             if not replaced:
                 for target in list(subscriptions.keys()):
@@ -1473,6 +1495,43 @@ async def cleanup_rate_limits(app):
         for key in [k for k, v in throttle_state.items() if now - v[0] > 600]:
             del throttle_state[key]
 
+ONLINE_RESULT_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+def build_online_snapshot():
+    now = time.time()
+    players = []
+    for info in sorted(connection_info.values(), key=lambda i: i["connected_at"]):
+        players.append({
+            "username": info["username"],
+            "canonical_uuid": info["canonical_uuid"],
+            "aliases": info["aliases"],
+            "version": info["version"],
+            "ip": info["ip"],
+            "auth": info["auth"],
+            "reason": info["reason"],
+            "registered": info["registered"],
+            "avatar": "yes" if info["avatar"] else "no",
+            "connected_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info["connected_at"])),
+            "duration": fmt_dur(now - info["connected_at"]),
+        })
+    return {"online": len(players), "players": players}
+
+def write_admin_result(result_id, payload):
+    if not isinstance(result_id, str) or not ONLINE_RESULT_ID_RE.match(result_id):
+        logging.warning("[ADMIN] online request without a valid id")
+        return
+    now = time.time()
+    for old in glob.glob("data/.admin_result_*.json"):
+        try:
+            if now - os.path.getmtime(old) > 60:
+                os.remove(old)
+        except OSError:
+            pass
+    final_path = f"data/.admin_result_{result_id}.json"
+    tmp_path = final_path + ".tmp"
+    save_secure_file(tmp_path, json.dumps(payload))
+    os.replace(tmp_path, final_path)
+
 def process_admin_commands():
     commands = []
     for file_path in glob.glob("data/.admin_command_*.json"):
@@ -1500,6 +1559,10 @@ async def admin_command_poller(app):
                 continue
                 
             b_type = data.get("type")
+            if b_type == "online":
+                snapshot = build_online_snapshot()
+                await asyncio.to_thread(write_admin_result, data.get("id"), snapshot)
+                continue
             packet = None
             
             if b_type == "chat":
@@ -1559,11 +1622,93 @@ async def cleanup_background_tasks(app):
     except asyncio.CancelledError:
         pass
 
+ROOT_SCRIPT = """(function(){
+var b=document.getElementById('copy'),a=document.getElementById('addr');
+b.hidden=false;
+function done(ok){
+b.textContent=ok?'Copied':'Press Ctrl+C';
+setTimeout(function(){b.textContent='Copy'},1600);
+}
+function legacy(){
+var r=document.createRange();
+r.selectNodeContents(a);
+var s=window.getSelection();
+s.removeAllRanges();
+s.addRange(r);
+var ok=false;
+try{ok=document.execCommand('copy')}catch(e){}
+done(ok);
+}
+b.addEventListener('click',function(){
+var t=a.textContent.trim();
+if(navigator.clipboard&&window.isSecureContext){
+navigator.clipboard.writeText(t).then(function(){done(true)},legacy);
+}else{
+legacy();
+}
+});
+})();"""
+
+ROOT_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Not here · Figura Unchained</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9A%AB%3C/text%3E%3C/svg%3E">
+<style>
+:root{--bg1:#f6f7fb;--bg2:#e3e7f7;--card:#fff;--fg:#1b1e2b;--muted:#5d6479;--accent:#6c5ce7;--btnfg:#fff;--pill:#f0efff;--border:#dcdff0}
+@media (prefers-color-scheme:dark){:root{--bg1:#0e1020;--bg2:#1a1e3d;--card:#1a1d36;--fg:#eceefa;--muted:#9aa1bd;--accent:#a29bfe;--btnfg:#12142b;--pill:#25284a;--border:#2c3058}}
+*{box-sizing:border-box}
+html,body{min-height:100%;margin:0}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:radial-gradient(1200px 600px at 20% 0%,var(--bg2),var(--bg1))}
+main{width:100%;max-width:520px;padding:40px 32px;text-align:center;background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:0 20px 60px rgba(20,20,60,.18)}
+.emoji{font-size:56px;line-height:1}
+h1{margin:16px 0 8px;font-size:34px;letter-spacing:-.02em}
+p{margin:0 0 14px;color:var(--muted);line-height:1.55}
+.row{display:flex;gap:10px;align-items:stretch;margin:22px 0 8px}
+.addr{flex:1;min-width:0;margin:0;padding:14px 16px;border:1px dashed var(--accent);border-radius:12px;background:var(--pill);color:var(--accent);font:600 18px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;text-align:left;user-select:all}
+button{padding:0 20px;border:0;border-radius:12px;background:var(--accent);color:var(--btnfg);font:600 15px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;cursor:pointer;white-space:nowrap}
+button:hover{filter:brightness(1.08)}
+button:active{transform:translateY(1px)}
+.hint{font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<div class="emoji">🚫</div>
+<h1>Not here.</h1>
+<p>This address is not a website. Don't open it in a browser. Paste it into the <b>Figura Cloud IP</b> field in Figura's settings instead.</p>
+<div class="row"><code class="addr" id="addr">{{HOST}}</code><button type="button" id="copy" hidden>Copy</button></div>
+<p class="hint">The Figura Unchained addon must be installed.</p>
+</main>
+<script>{{SCRIPT}}</script>
+</body>
+</html>
+""".replace('{{SCRIPT}}', ROOT_SCRIPT)
+
+ROOT_SCRIPT_HASH = base64.b64encode(hashlib.sha256(ROOT_SCRIPT.encode('utf-8')).digest()).decode('ascii')
+
+ROOT_HOST_RE = re.compile(r'^[A-Za-z0-9.\-]{1,253}(:[0-9]{1,5})?$')
+
+ROOT_HEADERS = {
+    "Content-Security-Policy": f"default-src 'none'; script-src 'sha256-{ROOT_SCRIPT_HASH}'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-cache",
+}
+
+async def handle_root(request):
+    host = request.host if ROOT_HOST_RE.match(request.host or '') else 'your-server-address'
+    return web.Response(text=ROOT_PAGE.replace('{{HOST}}', host), content_type='text/html', charset='utf-8', headers=ROOT_HEADERS)
+
 app = web.Application(middlewares=[security_middleware], client_max_size=MAX_AVATAR_SIZE)
 
 app.on_startup.append(start_background_tasks)
 app.on_cleanup.append(cleanup_background_tasks)
 
+app.router.add_get('/', handle_root)
 app.router.add_get('/api/', handle_api_check)
 app.router.add_get('/api', handle_api_check)
 app.router.add_get('/api/version', handle_version)
