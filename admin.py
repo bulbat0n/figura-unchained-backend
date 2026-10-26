@@ -99,9 +99,10 @@ def main():
     os.replace(tmp_file, final_file)
 
     if cmd_type == "online":
-        result_file = f"data/.admin_result_{unique_id}.json"
+        result_name = f".admin_result_{unique_id}.json"
+        result_file = f"data/{result_name}"
         for _ in range(100):
-            if os.path.exists(result_file):
+            if result_name in os.listdir("data"):
                 with open(result_file, "r", encoding="utf-8") as f:
                     result = json.load(f)
                 os.remove(result_file)
