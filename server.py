@@ -1663,7 +1663,7 @@ ROOT_PAGE = """<!doctype html>
 *{box-sizing:border-box}
 html,body{min-height:100%;margin:0}
 body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:radial-gradient(1200px 600px at 20% 0%,var(--bg2),var(--bg1))}
-main{width:100%;max-width:520px;padding:40px 32px;text-align:center;background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:0 20px 60px rgba(20,20,60,.18)}
+main{width:100%;max-width:680px;padding:40px 32px;text-align:center;background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:0 20px 60px rgba(20,20,60,.18)}
 .emoji{font-size:56px;line-height:1}
 h1{margin:16px 0 8px;font-size:34px;letter-spacing:-.02em}
 p{margin:0 0 14px;color:var(--muted);line-height:1.55}
