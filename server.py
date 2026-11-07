@@ -25,6 +25,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from dotenv import load_dotenv
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 load_dotenv()
 
@@ -124,6 +125,18 @@ try:
         config_errors.append("MAX_PRIDE_BADGE_ID must be between 0 and 255.")
 except ValueError:
     config_errors.append("Assets and badge settings must be integers.")
+
+IDENTITY_KEY = None
+IDENTITY_KEY_RAW = os.environ.get("IDENTITY_KEY", "").strip()
+if IDENTITY_KEY_RAW:
+    try:
+        identity_seed = base64.b64decode(IDENTITY_KEY_RAW, validate=True)
+        if len(identity_seed) != 32:
+            raise ValueError
+        IDENTITY_KEY = Ed25519PrivateKey.from_private_bytes(identity_seed)
+    except ValueError:
+        config_errors.append("IDENTITY_KEY must be base64 of a 32-byte Ed25519 seed.")
+IDENTITY_NONCE_RE = re.compile(r'^[0-9a-f]{64}$')
 
 ASSETS_REPO = os.environ.get("ASSETS_REPO", "").strip() or "FiguraMC/Assets"
 ASSETS_REF = os.environ.get("ASSETS_REF", "").strip() or "main"
@@ -932,7 +945,12 @@ async def handle_api_check(request):
     return web.json_response({"status": "ok"})
 
 async def handle_version(request):
-    return web.json_response({"release": "0.1.5", "prerelease": "0.1.5", "unchained_api": 1})
+    body = {"release": "0.1.5", "prerelease": "0.1.5", "unchained_api": 1}
+    nonce = request.query.get("nonce", "")
+    if IDENTITY_KEY is not None and IDENTITY_NONCE_RE.match(nonce):
+        message = ("figura-unchained-identity-v1\n" + nonce).encode("utf-8")
+        body["sig"] = base64.b64encode(IDENTITY_KEY.sign(message)).decode("ascii")
+    return web.json_response(body)
 
 async def handle_limits(request):
     return web.json_response({"rate": {"upload": MAX_PING_BPS, "download": MAX_PING_BPS}, "limits": {"maxAvatarSize": MAX_AVATAR_SIZE}})
