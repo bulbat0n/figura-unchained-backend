@@ -196,6 +196,7 @@ if users_columns[:1] != ['username']:
         db_conn.rollback()
         raise
 db_conn.execute('CREATE TABLE IF NOT EXISTS user_badges (uuid TEXT PRIMARY KEY, badge INTEGER NOT NULL)')
+db_conn.execute('CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, reporter_uuid TEXT NOT NULL, reporter_name TEXT, reporter_ip TEXT, target_uuid TEXT NOT NULL, target_name TEXT NOT NULL, avatar_hash TEXT, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'open\')')
 db_conn.commit()
 db_lock = threading.Lock()
 
@@ -1473,6 +1474,64 @@ async def set_badge(request):
     log_info(f"[BADGE] {action} {user_tag(client_uuid)} watchers={watchers} ip={ip}")
     return web.json_response({"status": "success"})
 
+REPORT_BODY_MAX = 2048
+REPORT_REASON_MAX = 200
+REPORT_MAX_PER_DAY = 5
+
+def db_add_report_sync(reporter_uuid, reporter_name, ip, target_uuid, target_name, avatar_hash, reason):
+    now = int(time.time())
+    with db_lock:
+        recent = db_conn.execute("SELECT COUNT(*) FROM reports WHERE reporter_uuid = ? AND created_at > ?", (reporter_uuid, now - 86400)).fetchone()[0]
+        if recent >= REPORT_MAX_PER_DAY:
+            return "limit", None
+        if db_conn.execute("SELECT 1 FROM reports WHERE reporter_uuid = ? AND target_uuid = ? AND status = 'open'", (reporter_uuid, target_uuid)).fetchone():
+            return "duplicate", None
+        cursor = db_conn.execute("INSERT INTO reports (created_at, reporter_uuid, reporter_name, reporter_ip, target_uuid, target_name, avatar_hash, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (now, reporter_uuid, reporter_name, ip, target_uuid, target_name, avatar_hash, reason))
+        db_conn.commit()
+        return "ok", cursor.lastrowid
+
+async def submit_report(request):
+    ip = request['real_ip']
+    raw_token = request.headers.get('token', '')
+    client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
+    if not is_valid_uuid(client_uuid):
+        return web.json_response({"error": "Invalid token"}, status=400)
+    authed, auth_reason = auth_status(request, client_uuid)
+    if not authed:
+        log_info(f"[REPORT] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+    if request.content_length is None or request.content_length > REPORT_BODY_MAX:
+        return web.json_response({"error": "Invalid report"}, status=400)
+    try:
+        body = json.loads(await request.read())
+    except ValueError:
+        return web.json_response({"error": "Invalid report"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "Invalid report"}, status=400)
+    target = clean_username(body.get("target"))
+    reason = body.get("reason")
+    if target is None or not isinstance(reason, str):
+        return web.json_response({"error": "Invalid report"}, status=400)
+    reason = reason.strip()
+    if not 1 <= len(reason) <= REPORT_REASON_MAX or not reason.isprintable():
+        return web.json_response({"error": f"The reason must be 1-{REPORT_REASON_MAX} printable characters"}, status=400)
+    target_uuid = canonical_uuid_for(target)
+    if target_uuid == client_uuid:
+        return web.json_response({"error": "You cannot report yourself"}, status=400)
+    file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
+    if not os.path.exists(file_path):
+        return web.json_response({"error": "This player has no avatar"}, status=404)
+    if target_uuid not in hash_cache:
+        hash_cache[target_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
+    reporter_name = username_for_canonical(client_uuid)
+    result, report_id = await asyncio.to_thread(db_add_report_sync, client_uuid, reporter_name, ip, target_uuid, target, hash_cache[target_uuid], reason)
+    if result == "limit":
+        return web.json_response({"error": f"Report limit reached ({REPORT_MAX_PER_DAY} per day)"}, status=429)
+    if result == "duplicate":
+        return web.json_response({"error": "You already have an open report about this player"}, status=409)
+    log_warn(f"[REPORT] #{report_id} {user_tag(client_uuid)} reported {shown(target)} ip={ip} reason={shown(reason, 80)}")
+    return web.json_response({"status": "success", "id": report_id})
+
 ASSET_HEADERS = {"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"}
 
 async def assets_index(request):
@@ -1741,6 +1800,7 @@ app.router.add_get(r'/api/{uuid:[0-9a-fA-F\-]{36}}/avatar', download_avatar)
 app.router.add_put('/api/avatar', upload_avatar)
 app.router.add_post('/api/equip', equip_avatar)
 app.router.add_post('/api/temp_badges', set_badge)
+app.router.add_post('/api/report', submit_report)
 for assets_prefix in ('/assets', '/api/assets', '/api//assets'):
     app.router.add_get(assets_prefix + r'/{version:v\d+}', assets_index)
     app.router.add_get(assets_prefix + r'/{version:v\d+}/{path:.+}', assets_file)
