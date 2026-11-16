@@ -222,6 +222,12 @@ UUID_REGEX = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA
 def is_valid_uuid(val):
     return bool(val and UUID_REGEX.match(val))
 
+def is_offline_uuid(val):
+    if not is_valid_uuid(val):
+        return False
+    parsed = uuid.UUID(val)
+    return parsed.version == 3 and parsed.variant == uuid.RFC_4122
+
 def log_info(msg):
     logging.info(msg)
 
@@ -502,6 +508,8 @@ def load_user_aliases():
 def auth_status(request, client_uuid):
     if not REQUIRE_AUTH:
         return True, "auth-disabled"
+    if not is_offline_uuid(client_uuid):
+        return False, "uuid-not-offline"
     token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -933,13 +941,15 @@ async def read_auth_body(request):
     if len(client_hash.encode('utf-8')) > 72:
         return None, None, None, "hash-too-long"
     client_uuid = client_uuid.lower()
-    username = None
-    if raw_username is not None:
-        username = clean_username(raw_username)
-        if username is None:
-            return None, None, None, f"invalid-username {shown(raw_username)}"
-        if canonical_uuid_for(username) != client_uuid:
-            return None, None, None, f"uuid-username-mismatch username={username!r} uuid={client_uuid}"
+    if not is_offline_uuid(client_uuid):
+        return None, None, None, f"uuid-not-offline {client_uuid}"
+    if raw_username is None:
+        return None, None, None, "username-missing"
+    username = clean_username(raw_username)
+    if username is None:
+        return None, None, None, f"invalid-username {shown(raw_username)}"
+    if canonical_uuid_for(username) != client_uuid:
+        return None, None, None, f"uuid-username-mismatch username={username!r} uuid={client_uuid}"
     return client_uuid, username, client_hash, None
 
 async def handle_api_check(request):
