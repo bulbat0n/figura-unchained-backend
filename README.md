@@ -12,7 +12,11 @@ This is a custom backend for the Figura Unchained addon. It handles custom user 
 ## 📂 Project Structure
 
 * `server.py` — The main backend application.
-* `admin.py` — CLI tool for secure server administration (broadcasts, toasts, online list).
+* `admin.py` — CLI tool for secure server administration (broadcasts, toasts, online list, reports, account deletion and bans).
+* `toasts.py` — Every toast text the backend sends, in one place.
+* `toastfit.py` — Measures text the way Minecraft does, to check that a toast fits its frame.
+* `tests/` — Checks that every toast fits: `python3 -m unittest discover -s tests`
+* `legacy.py` — LEGACY-1.9.5: short error texts for Figura Unchained 1.9.5 and older. Delete it, and every line `grep -rn "LEGACY-1.9.5" .` finds, once `MIN_ADDON_VERSION` is 1.9.6 or higher.
 * `data/` — Directory created automatically to store the database, avatars and local session secrets.
 
 ## 🛠️ Setup & Installation
@@ -42,6 +46,7 @@ Create a `.env` file in the root directory (or copy `.env.example`). The backend
 * `DEBUG` — `true` or `false`. Enables detailed logging for HTTP requests and WebSocket events.
 * `AVATAR_DIR` — Path to the directory where `.nbt` skins will be stored (e.g., `data/avatars`).
 * `REQUIRE_AUTH` — `true` or `false`. If true, players must register and log in to upload avatars and broadcast pings.
+* `TOKEN_LIFETIME_DAYS` — How many days a login stays valid (1-3650). After that the player has to run `/figura-unchained login` again.
 * `MAX_PING_BPS` — Maximum bytes per second allowed for a single client's WebSocket ping data.
 * `MAX_PING_SIZE` — Maximum size (in bytes) of a single WebSocket ping packet.
 * `MAX_AVATAR_SIZE` — Maximum size (in bytes) allowed for an uploaded `.nbt` avatar file.
@@ -58,6 +63,8 @@ Create a `.env` file in the root directory (or copy `.env.example`). The backend
 * `ASSETS_RATE_LIMIT_REQUESTS` — Number of `/assets/...` requests allowed per IP address within the assets rate limit window. These requests use their own bucket and do not count towards `RATE_LIMIT_REQUESTS`. A fresh client needs about one request per asset file plus one for the index (about 125 for `v2`), so keep this comfortably above that, especially if many players share one IP.
 * `ASSETS_RATE_LIMIT_WINDOW` — The time window (in seconds) for the assets rate limiter.
 * `MAX_PRIDE_BADGE_ID` — The highest pride badge number accepted by `/figura badge`. Figura 0.1.6 has 25 badges (0-24); keep some headroom for future versions (maximum 255).
+* `REPORT_REASON_MAX` — Maximum length of an avatar report reason, in characters (1-200). The reason is typed in chat, which limits the whole command to 256 characters.
+* `REPORT_MAX_PER_DAY` — How many avatar reports one player can send within 24 hours (1-1000).
 * `ASSETS_REPO` — (Optional) GitHub repository with the assets, default `FiguraMC/Assets`.
 * `ASSETS_REF` — (Optional) Branch, tag or full commit SHA to mirror, default `main`. Use a commit SHA to pin the assets to a reviewed version.
 * `GITHUB_TOKEN` — (Optional) GitHub token used only for the commit lookup request, to avoid the anonymous API rate limit. Leave blank if not needed.
@@ -91,8 +98,27 @@ The server uses a secure, file-based IPC queue for admin commands. You run these
 * Send a GUI toast notification:
   `python3 admin.py toast <type> "Title" "Description"`
   *(Types: 1 = Default, 2 = Warning, 3 = Error, 4 = Cheese)*
+  If the title or the description does not fit into the toast frame, `admin.py` asks before sending it.
 * List connected players with connection details and duration:
   `python3 admin.py online`
+
+**Moderation:**
+These commands work directly with `data/users.db` and the avatar folder, so they also work while the server is stopped. If the server is running, it is notified as well.
+
+* List open avatar reports (`all` includes closed ones):
+  `python3 admin.py reports [all]`
+* Close a report:
+  `python3 admin.py reports close <id>`
+* Delete an account, its badge and its avatar. The player can register again:
+  `python3 admin.py delete <nickname|uuid>`
+* Ban an account: same as `delete`, plus registration and login are refused and the player is disconnected from the backend:
+  `python3 admin.py ban <nickname|uuid> [reason]`
+* Lift a ban:
+  `python3 admin.py unban <nickname|uuid>`
+* List bans:
+  `python3 admin.py bans`
+
+*Nicknames must follow Mojang rules: 3-16 characters, `A-Z`, `a-z`, `0-9`, `_`.*
 
 ---
 

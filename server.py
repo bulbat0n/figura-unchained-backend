@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import toasts
+import legacy  # LEGACY-1.9.5
 
 load_dotenv()
 
@@ -38,7 +40,8 @@ REQUIRED_VARS = [
     "LOGIN_RATE_LIMIT_REQUESTS", "LOGIN_RATE_LIMIT_WINDOW",
     "MAX_AVATAR_UNPACKED_SIZE", "MIN_ADDON_VERSION",
     "ASSETS_UPDATE_INTERVAL_HOURS", "ASSETS_RATE_LIMIT_REQUESTS",
-    "ASSETS_RATE_LIMIT_WINDOW", "MAX_PRIDE_BADGE_ID"
+    "ASSETS_RATE_LIMIT_WINDOW", "MAX_PRIDE_BADGE_ID",
+    "REPORT_REASON_MAX", "REPORT_MAX_PER_DAY", "TOKEN_LIFETIME_DAYS"
 ]
 
 missing_vars = [var for var in REQUIRED_VARS if not os.environ.get(var)]
@@ -126,6 +129,23 @@ try:
 except ValueError:
     config_errors.append("Assets and badge settings must be integers.")
 
+try:
+    REPORT_REASON_MAX = int(os.environ.get("REPORT_REASON_MAX"))
+    REPORT_MAX_PER_DAY = int(os.environ.get("REPORT_MAX_PER_DAY"))
+    if not 1 <= REPORT_REASON_MAX <= 200:
+        config_errors.append("REPORT_REASON_MAX must be between 1 and 200.")
+    if not 1 <= REPORT_MAX_PER_DAY <= 1000:
+        config_errors.append("REPORT_MAX_PER_DAY must be between 1 and 1000.")
+except ValueError:
+    config_errors.append("Report settings must be integers.")
+
+try:
+    TOKEN_LIFETIME_DAYS = int(os.environ.get("TOKEN_LIFETIME_DAYS"))
+    if not 1 <= TOKEN_LIFETIME_DAYS <= 3650:
+        config_errors.append("TOKEN_LIFETIME_DAYS must be between 1 and 3650.")
+except ValueError:
+    config_errors.append("TOKEN_LIFETIME_DAYS must be an integer.")
+
 IDENTITY_KEY = None
 IDENTITY_KEY_RAW = os.environ.get("IDENTITY_KEY", "").strip()
 if IDENTITY_KEY_RAW:
@@ -197,6 +217,7 @@ if users_columns[:1] != ['username']:
         raise
 db_conn.execute('CREATE TABLE IF NOT EXISTS user_badges (uuid TEXT PRIMARY KEY, badge INTEGER NOT NULL)')
 db_conn.execute('CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, reporter_uuid TEXT NOT NULL, reporter_name TEXT, reporter_ip TEXT, target_uuid TEXT NOT NULL, target_name TEXT NOT NULL, avatar_hash TEXT, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'open\')')
+db_conn.execute('CREATE TABLE IF NOT EXISTS bans (uuid TEXT PRIMARY KEY, username TEXT, reason TEXT, created_at INTEGER NOT NULL)')
 db_conn.commit()
 db_lock = threading.Lock()
 
@@ -218,6 +239,7 @@ def cleanup_admin_session():
 atexit.register(cleanup_admin_session)
 
 UUID_REGEX = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+USERNAME_RE = re.compile(r'[A-Za-z0-9_]{3,16}')
 
 def is_valid_uuid(val):
     return bool(val and UUID_REGEX.match(val))
@@ -289,11 +311,7 @@ def canonical_uuid_for(username):
     return str(uuid.UUID(bytes=digest, version=3))
 
 def clean_username(name):
-    if not isinstance(name, str) or not 1 <= len(name) <= 32:
-        return None
-    if UUID_REGEX.match(name):
-        return None
-    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in name):
+    if not isinstance(name, str) or not USERNAME_RE.fullmatch(name):
         return None
     return name
 
@@ -437,7 +455,31 @@ def addon_version_status(version):
         return "outdated"
     return "ok"
 
-UPDATE_TOAST_PACKET = b'\x03\x02' + "Please update Figura Unchained".encode('utf-8') + b'\x00' + f"Minimum version for your backend is {MIN_ADDON_VERSION_RAW}".encode('utf-8')
+TOAST_VALUES = {"min_version": MIN_ADDON_VERSION_RAW, "reason_max": REPORT_REASON_MAX, "per_day": REPORT_MAX_PER_DAY}
+BANNED_CLOSE_CODE = 4101
+
+def toast_response(key, http_status, **extra):
+    body = {**toasts.fields(key, **TOAST_VALUES), **extra}
+    legacy.add_error(body, key, **TOAST_VALUES)  # LEGACY-1.9.5
+    return web.json_response(body, status=http_status)
+
+def toast_packet(key):
+    return toasts.packet(key, **TOAST_VALUES)
+
+def close_reason(key):
+    return toasts.close_reason(key, **TOAST_VALUES)
+
+def auth_failure_response(reason):
+    if reason == "account-banned":
+        return toast_response("banned", 403)
+    return toast_response("not_logged_in", 401)
+
+def auth_body_toast(reason):
+    if reason.startswith("invalid-username"):
+        return "username"
+    if reason.startswith("uuid-username-mismatch"):
+        return "username_mismatch"
+    return "auth_invalid"
 
 async def safe_send(ws, packet):
     try:
@@ -493,6 +535,14 @@ def db_login_sync(client_uuid, username, client_hash, real_ip):
         return True
     return False
 
+def db_account_status_sync(client_uuid):
+    with db_lock:
+        if db_conn.execute("SELECT 1 FROM bans WHERE uuid = ?", (client_uuid,)).fetchone():
+            return "banned"
+        if db_conn.execute("SELECT 1 FROM users WHERE uuid = ?", (client_uuid,)).fetchone() is None:
+            return "unregistered"
+    return "ok"
+
 def load_user_aliases():
     with db_lock:
         rows = db_conn.execute("SELECT uuid, username FROM users WHERE username IS NOT NULL").fetchall()
@@ -506,6 +556,9 @@ def load_user_aliases():
     return loaded
 
 def auth_status(request, client_uuid):
+    state = db_account_status_sync(client_uuid)
+    if state == "banned":
+        return False, "account-banned"
     if not REQUIRE_AUTH:
         return True, "auth-disabled"
     if not is_offline_uuid(client_uuid):
@@ -528,6 +581,8 @@ def auth_status(request, client_uuid):
         return False, "token-invalid"
     if payload.get("uuid") != client_uuid:
         return False, "token-uuid-mismatch"
+    if state != "ok":
+        return False, f"account-{state}"
     return True, "ok"
 
 def check_auth(request, client_uuid):
@@ -886,7 +941,7 @@ async def security_middleware(request, handler):
             rate_limits[real_ip]["count"] += 1
             if rate_limits[real_ip]["count"] > RATE_LIMIT_REQUESTS:
                 log_throttled(f"rate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s (last: {request.method} {request.path!r})")
-                return web.json_response({"error": "Too Many Requests"}, status=429)
+                return toast_response("rate", 429)
 
     if LOGIN_RATE_LIMIT_REQUESTS > 0 and request.method == "POST" and request.path in AUTH_PATHS:
         entry = auth_rate_limits.get(real_ip)
@@ -895,7 +950,7 @@ async def security_middleware(request, handler):
         entry["count"] += 1
         if entry["count"] > LOGIN_RATE_LIMIT_REQUESTS:
             log_throttled(f"authrate:{real_ip}", f"[RATE] 429 ip={real_ip} exceeded {LOGIN_RATE_LIMIT_REQUESTS} auth attempts per {LOGIN_RATE_LIMIT_WINDOW}s ({request.path})")
-            return web.json_response({"error": "Too Many Requests"}, status=429)
+            return toast_response("rate", 429)
 
     ignore_logs = ['/api/version', '/api/limits', '/api/motd', '/api/', '/api', '/api/auth/register', '/api/auth/login']
     if request.path not in ignore_logs and not asset_request:
@@ -910,7 +965,7 @@ async def security_middleware(request, handler):
             log_throttled(f"oldhttp:{real_ip}", f"[HTTP] REJECT 426 ip={real_ip} {request.method} {request.path!r} addon-version={http_version or 'none'} status={http_status} (minimum {MIN_ADDON_VERSION_RAW})")
             if http_status != "outdated" and request.path in VANILLA_AUTH_PATHS:
                 return web.Response(status=426, text=f"Please download Figura Unchained. Minimum version for your backend is {MIN_ADDON_VERSION_RAW}", content_type="text/plain")
-            return web.json_response({"error": f"Please update Figura Unchained. Minimum version for your backend is {MIN_ADDON_VERSION_RAW}"}, status=426)
+            return toast_response("update", 426, error=toasts.OUTDATED_CLIENT_ERROR)
 
     try:
         return await handler(request)
@@ -982,43 +1037,46 @@ async def handle_register(request):
     client_uuid, username, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
         log_warn(f"[AUTH] register REJECT ip={ip} reason=bad-request: {reason}")
-        return web.json_response({"error": "Invalid data format"}, status=400)
+        return toast_response(auth_body_toast(reason), 400)
+    if await asyncio.to_thread(db_account_status_sync, client_uuid) == "banned":
+        log_warn(f"[AUTH] register REJECT {auth_tag(client_uuid, username)} ip={ip} reason=banned")
+        return toast_response("banned", 403)
 
     success = await asyncio.to_thread(db_register_sync, client_uuid, username, client_hash, ip)
     if not success:
         log_info(f"[AUTH] register FAIL {auth_tag(client_uuid, username)} ip={ip} reason=already-registered")
-        return web.json_response({"error": "Already registered. Please login."}, status=409)
+        return toast_response("already_registered", 409)
 
     if username:
         register_known_user(username)
-    token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
+    token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=TOKEN_LIFETIME_DAYS)}, JWT_SECRET, algorithm="HS256")
     log_info(f"[AUTH] register OK {auth_tag(client_uuid, username)} ip={ip} {request_version_text(request)}")
-    return web.json_response({
-        "status": "success",
-        "token": token,
-        "title": "Malicious or NSFW content is prohibited",
-        "message": "Author IPs are logged by backend's owner"
-    })
+    return toast_response("registered", 200, status="success", token=token)
 
 async def handle_login(request):
     ip = request['real_ip']
     client_uuid, username, client_hash, reason = await read_auth_body(request)
     if client_uuid is None:
         log_warn(f"[AUTH] login REJECT ip={ip} reason=bad-request: {reason}")
-        return web.json_response({"error": "Invalid data format"}, status=400)
+        return toast_response(auth_body_toast(reason), 400)
+    if await asyncio.to_thread(db_account_status_sync, client_uuid) == "banned":
+        log_warn(f"[AUTH] login REJECT {auth_tag(client_uuid, username)} ip={ip} reason=banned")
+        return toast_response("banned", 403)
 
     success = await asyncio.to_thread(db_login_sync, client_uuid, username, client_hash, ip)
     if not success:
         registered = await asyncio.to_thread(db_is_registered_sync, client_uuid)
         why = "wrong-password" if registered else "uuid-not-registered"
         log_info(f"[AUTH] login FAIL {auth_tag(client_uuid, username)} ip={ip} reason={why}")
-        return web.json_response({"error": "Invalid password or UUID"}, status=401)
+        if not registered:
+            return toast_response("not_registered", 404)
+        return toast_response("wrong_password", 401)
 
     if username:
         register_known_user(username)
-    token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
+    token = jwt.encode({"uuid": client_uuid, "exp": datetime.now(timezone.utc) + timedelta(days=TOKEN_LIFETIME_DAYS)}, JWT_SECRET, algorithm="HS256")
     log_info(f"[AUTH] login OK {auth_tag(client_uuid, username)} ip={ip} {request_version_text(request)}")
-    return web.json_response({"status": "success", "token": token})
+    return toast_response("logged_in", 200, status="success", token=token)
 
 async def handle_user_profile(request):
     requested = os.path.basename(request.match_info['uuid']).lower()
@@ -1093,8 +1151,9 @@ async def upload_avatar(request):
 
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[UPLOAD] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
-        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+        response = auth_failure_response(auth_reason)
+        log_info(f"[UPLOAD] REJECT {response.status} {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return response
         
     if request.content_length and request.content_length > MAX_AVATAR_SIZE:
         return reject_upload(client_uuid, ip, 413, f"too-large declared={request.content_length} limit={MAX_AVATAR_SIZE}", "File exceeds MAX_AVATAR_SIZE")
@@ -1173,15 +1232,16 @@ async def delete_avatar(request):
 
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[DELETE] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
-        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+        response = auth_failure_response(auth_reason)
+        log_info(f"[DELETE] REJECT {response.status} {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return response
 
     file_path = os.path.join(AVATAR_DIR, f"{client_uuid}.nbt")
     if os.path.exists(file_path):
         await asyncio.to_thread(os.remove, file_path)
         users_with_avatars.discard(client_uuid)
         hash_cache.pop(client_uuid, None)
-        watchers = await notify_avatar_update(ident, "Skin deletion")
+        watchers = await notify_avatar_update(ident, "Skin deletion", include_self=True)
         log_info(f"[DELETE] OK {user_tag(client_uuid)} watchers={watchers} ip={ip}")
     else:
         log_info(f"[DELETE] {user_tag(client_uuid)} ip={ip} nothing to delete (no avatar stored)")
@@ -1212,8 +1272,14 @@ async def websocket_handler(request):
         version_status = addon_version_status(addon_version)
         if version_status != "ok":
             log_warn(f"[WS] REJECT {user_tag(client_uuid)} ip={real_ip} addon-version={addon_version or 'none'} status={version_status} (minimum {MIN_ADDON_VERSION_RAW}): closing connection")
-            await safe_send(ws, UPDATE_TOAST_PACKET)
+            await safe_send(ws, toast_packet("update"))
             await ws.close(code=4100, message=MIN_ADDON_VERSION_RAW.encode('utf-8'))
+            return ws
+
+        if await asyncio.to_thread(db_account_status_sync, client_uuid) == "banned":
+            log_warn(f"[WS] REJECT {user_tag(client_uuid)} ip={real_ip} reason=banned: closing connection")
+            await safe_send(ws, toast_packet("banned"))
+            await ws.close(code=BANNED_CLOSE_CODE, message=close_reason("banned"))
             return ws
 
         is_authenticated, auth_reason = auth_status(request, client_uuid)
@@ -1294,7 +1360,7 @@ async def websocket_handler(request):
         msg_count = 0
         msg_reset_time = time.time()
         client_subs = 0
-        auth_msg = ""
+        auth_toast = None
         pings_in = 0
         pings_relayed = 0
         drops = {}
@@ -1310,14 +1376,12 @@ async def websocket_handler(request):
             if REQUIRE_AUTH:
                 if not is_authenticated:
                     if is_registered:
-                        auth_msg = "Type /figura-unchained login <password>"
+                        auth_toast = "auth_required_login"
                     else:
-                        auth_msg = "Type /figura-unchained register <password>"
-                    toast_packet = b'\x03\x02' + "Auth Required".encode('utf-8') + b'\x00' + auth_msg.encode('utf-8')
-                    await ws.send_bytes(toast_packet)
+                        auth_toast = "auth_required_register"
+                    await ws.send_bytes(toast_packet(auth_toast))
                 else:
-                    toast_packet = b'\x03\x00' + "Authenticated".encode('utf-8') + b'\x00' + "Connected successfully.".encode('utf-8')
-                    await ws.send_bytes(toast_packet)
+                    await ws.send_bytes(toast_packet("authenticated"))
 
             for alias in (registered_session, registered_world):
                 if alias and has_avatar:
@@ -1351,8 +1415,8 @@ async def websocket_handler(request):
                         pings_in += 1
                         if not is_authenticated:
                             note_drop("ping", "not-authenticated", "(player has to /figura-unchained login or register)")
-                            toast_packet = b'\x03\x02' + "Auth Required".encode('utf-8') + b'\x00' + auth_msg.encode('utf-8')
-                            await ws.send_bytes(toast_packet)
+                            if auth_toast:
+                                await ws.send_bytes(toast_packet(auth_toast))
                             continue
 
                         if client_uuid not in users_with_avatars:
@@ -1458,8 +1522,9 @@ async def set_badge(request):
 
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[BADGE] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
-        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+        response = auth_failure_response(auth_reason)
+        log_info(f"[BADGE] REJECT {response.status} {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return response
 
     if request.content_length is None or request.content_length > 16:
         log_info(f"[BADGE] REJECT 400 {user_tag(client_uuid)} ip={ip} reason=bad-body-size length={request.content_length}")
@@ -1485,8 +1550,6 @@ async def set_badge(request):
     return web.json_response({"status": "success"})
 
 REPORT_BODY_MAX = 2048
-REPORT_REASON_MAX = 200
-REPORT_MAX_PER_DAY = 5
 
 def db_add_report_sync(reporter_uuid, reporter_name, ip, target_uuid, target_name, avatar_hash, reason):
     now = int(time.time())
@@ -1505,42 +1568,43 @@ async def submit_report(request):
     raw_token = request.headers.get('token', '')
     client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
     if not is_valid_uuid(client_uuid):
-        return web.json_response({"error": "Invalid token"}, status=400)
+        return toast_response("not_logged_in", 401)
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
-        log_info(f"[REPORT] REJECT 401 {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
-        return web.json_response({"error": "Unauthorized. Please login."}, status=401)
+        response = auth_failure_response(auth_reason)
+        log_info(f"[REPORT] REJECT {response.status} {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
+        return response
     if request.content_length is None or request.content_length > REPORT_BODY_MAX:
-        return web.json_response({"error": "Invalid report"}, status=400)
+        return toast_response("report_invalid", 400)
     try:
         body = json.loads(await request.read())
     except ValueError:
-        return web.json_response({"error": "Invalid report"}, status=400)
+        return toast_response("report_invalid", 400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "Invalid report"}, status=400)
+        return toast_response("report_invalid", 400)
     target = clean_username(body.get("target"))
     reason = body.get("reason")
     if target is None or not isinstance(reason, str):
-        return web.json_response({"error": "Invalid report"}, status=400)
+        return toast_response("report_invalid", 400)
     reason = reason.strip()
     if not 1 <= len(reason) <= REPORT_REASON_MAX or not reason.isprintable():
-        return web.json_response({"error": f"The reason must be 1-{REPORT_REASON_MAX} printable characters"}, status=400)
+        return toast_response("report_reason", 400)
     target_uuid = canonical_uuid_for(target)
     if target_uuid == client_uuid:
-        return web.json_response({"error": "You cannot report yourself"}, status=400)
+        return toast_response("report_self", 400)
     file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
     if not os.path.exists(file_path):
-        return web.json_response({"error": "This player has no avatar"}, status=404)
+        return toast_response("report_no_avatar", 404)
     if target_uuid not in hash_cache:
         hash_cache[target_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
     reporter_name = username_for_canonical(client_uuid)
     result, report_id = await asyncio.to_thread(db_add_report_sync, client_uuid, reporter_name, ip, target_uuid, target, hash_cache[target_uuid], reason)
     if result == "limit":
-        return web.json_response({"error": f"Report limit reached ({REPORT_MAX_PER_DAY} per day)"}, status=429)
+        return toast_response("report_limit", 429)
     if result == "duplicate":
-        return web.json_response({"error": "You already have an open report about this player"}, status=409)
+        return toast_response("report_duplicate", 409)
     log_warn(f"[REPORT] #{report_id} {user_tag(client_uuid)} reported {shown(target)} ip={ip} reason={shown(reason, 80)}")
-    return web.json_response({"status": "success", "id": report_id})
+    return toast_response("report_sent", 200, status="success", id=report_id)
 
 ASSET_HEADERS = {"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"}
 
@@ -1619,6 +1683,31 @@ def write_admin_result(result_id, payload):
     save_secure_file(tmp_path, json.dumps(payload))
     os.replace(tmp_path, final_path)
 
+async def purge_account(target_uuid, banned):
+    if not isinstance(target_uuid, str) or not is_valid_uuid(target_uuid):
+        logging.warning(f"[ADMIN] purge ignored: invalid uuid {shown(target_uuid)}")
+        return
+    target_uuid = target_uuid.lower()
+    username = username_for_canonical(target_uuid)
+    ident = username or target_uuid
+    file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
+    if os.path.exists(file_path):
+        await asyncio.to_thread(os.remove, file_path)
+    users_with_avatars.discard(target_uuid)
+    hash_cache.pop(target_uuid, None)
+    user_badges.pop(target_uuid, None)
+    watchers = await notify_avatar_update(ident, "Account ban" if banned else "Account deletion", include_self=True)
+    closed = 0
+    if banned:
+        for key in {ident, target_uuid}:
+            ws = active_connections.get(key)
+            if ws is None:
+                continue
+            await safe_send(ws, toast_packet("banned"))
+            await ws.close(code=BANNED_CLOSE_CODE, message=close_reason("banned"))
+            closed += 1
+    log_info(f"[ADMIN] {'ban' if banned else 'delete'} {user_tag(target_uuid)} watchers={watchers} closed={closed}")
+
 def process_admin_commands():
     commands = []
     for file_path in glob.glob("data/.admin_command_*.json"):
@@ -1649,6 +1738,9 @@ async def admin_command_poller(app):
             if b_type == "online":
                 snapshot = build_online_snapshot()
                 await asyncio.to_thread(write_admin_result, data.get("id"), snapshot)
+                continue
+            if b_type in ("delete_account", "ban_account"):
+                await purge_account(data.get("uuid"), b_type == "ban_account")
                 continue
             packet = None
             
@@ -1826,6 +1918,7 @@ def log_startup_summary():
     log_info(f"[SYS] Assets: repo={ASSETS_REPO}@{ASSETS_REF} update_every={ASSETS_UPDATE_INTERVAL_HOURS}h limit={ASSETS_RATE_LIMIT_REQUESTS}/{ASSETS_RATE_LIMIT_WINDOW}s github_token={'set' if GITHUB_TOKEN else 'not set'} | badges max_id={MAX_PRIDE_BADGE_ID} stored={len(user_badges)}")
     log_info(f"[SYS] Identity: usernames_known={len(user_canonical_uuids)} min_addon_version={MIN_ADDON_VERSION_RAW}")
     log_info(f"[SYS] Starting on {HOST}:{PORT} | debug={DEBUG} require_auth={REQUIRE_AUTH} | registered_users={users} avatars={avatars}")
+    legacy.warn_if_obsolete(MIN_ADDON_VERSION, log_warn)  # LEGACY-1.9.5
     log_info(f"[SYS] Limits: avatar={MAX_AVATAR_SIZE}B (unpacked {MAX_AVATAR_UNPACKED_SIZE}B), ping={MAX_PING_SIZE}B/{MAX_PING_BPS}Bps | http={RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s, auth={LOGIN_RATE_LIMIT_REQUESTS}/{LOGIN_RATE_LIMIT_WINDOW}s | ws: {WS_MAX_CONNECTIONS_PER_IP} conn/ip, {WS_MAX_MESSAGES_PER_SEC} msg/s, {WS_MAX_SUBS_PER_CLIENT} subs | trusted_proxies={len(trusted_networks)}")
 
 if __name__ == '__main__':
