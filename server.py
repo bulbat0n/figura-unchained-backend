@@ -1563,46 +1563,53 @@ def db_add_report_sync(reporter_uuid, reporter_name, ip, target_uuid, target_nam
         db_conn.commit()
         return "ok", cursor.lastrowid
 
+def report_reject(key, http_status, ip, client_uuid, reason, detail=""):
+    who = f"{user_tag(client_uuid)} " if client_uuid else ""
+    log_info(f"[REPORT] REJECT {http_status} {who}ip={ip} reason={reason}" + (f" {detail}" if detail else ""))
+    return toast_response(key, http_status)
+
 async def submit_report(request):
     ip = request['real_ip']
     raw_token = request.headers.get('token', '')
     client_uuid = (raw_token.split(':')[0] if ':' in raw_token else raw_token).lower()
     if not is_valid_uuid(client_uuid):
-        return toast_response("not_logged_in", 401)
+        return report_reject("not_logged_in", 401, ip, None, "bad-token")
     authed, auth_reason = auth_status(request, client_uuid)
     if not authed:
         response = auth_failure_response(auth_reason)
         log_info(f"[REPORT] REJECT {response.status} {user_tag(client_uuid)} ip={ip} reason={auth_reason}")
         return response
     if request.content_length is None or request.content_length > REPORT_BODY_MAX:
-        return toast_response("report_invalid", 400)
+        return report_reject("report_invalid", 400, ip, client_uuid, "bad-body", f"size={request.content_length}")
     try:
         body = json.loads(await request.read())
     except ValueError:
-        return toast_response("report_invalid", 400)
+        return report_reject("report_invalid", 400, ip, client_uuid, "bad-json")
     if not isinstance(body, dict):
-        return toast_response("report_invalid", 400)
+        return report_reject("report_invalid", 400, ip, client_uuid, "bad-json")
     target = clean_username(body.get("target"))
     reason = body.get("reason")
     if target is None or not isinstance(reason, str):
-        return toast_response("report_invalid", 400)
+        return report_reject("report_invalid", 400, ip, client_uuid, "bad-fields", f"target={shown(body.get('target'))}")
     reason = reason.strip()
-    if not 1 <= len(reason) <= REPORT_REASON_MAX or not reason.isprintable():
-        return toast_response("report_reason", 400)
+    if not 1 <= len(reason) <= REPORT_REASON_MAX:
+        return report_reject("report_reason", 400, ip, client_uuid, "reason-length", f"len={len(reason)} max={REPORT_REASON_MAX}")
+    if not reason.isprintable():
+        return report_reject("report_reason", 400, ip, client_uuid, "reason-unprintable")
     target_uuid = canonical_uuid_for(target)
     if target_uuid == client_uuid:
-        return toast_response("report_self", 400)
+        return report_reject("report_self", 400, ip, client_uuid, "self")
     file_path = os.path.join(AVATAR_DIR, f"{target_uuid}.nbt")
     if not os.path.exists(file_path):
-        return toast_response("report_no_avatar", 404)
+        return report_reject("report_no_avatar", 404, ip, client_uuid, "no-avatar", f"target={target}")
     if target_uuid not in hash_cache:
         hash_cache[target_uuid] = await asyncio.to_thread(get_file_hash_sync, file_path)
     reporter_name = username_for_canonical(client_uuid)
     result, report_id = await asyncio.to_thread(db_add_report_sync, client_uuid, reporter_name, ip, target_uuid, target, hash_cache[target_uuid], reason)
     if result == "limit":
-        return toast_response("report_limit", 429)
+        return report_reject("report_limit", 429, ip, client_uuid, "daily-limit", f"limit={REPORT_MAX_PER_DAY}")
     if result == "duplicate":
-        return toast_response("report_duplicate", 409)
+        return report_reject("report_duplicate", 409, ip, client_uuid, "duplicate", f"target={target}")
     log_warn(f"[REPORT] #{report_id} {user_tag(client_uuid)} reported {shown(target)} ip={ip} reason={shown(reason, 80)}")
     return toast_response("report_sent", 200, status="success", id=report_id)
 

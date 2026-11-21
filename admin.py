@@ -117,9 +117,16 @@ def reports_command(args):
             if len(args) < 2 or not args[1].isdigit():
                 print("Usage: python3 admin.py reports close <id>")
                 return
-            cursor = db.execute("UPDATE reports SET status = 'closed' WHERE id = ?", (int(args[1]),))
-            db.commit()
-            print(f"Report #{args[1]} closed." if cursor.rowcount else f"Report #{args[1]} not found.")
+            report_id = int(args[1])
+            row = db.execute("SELECT status FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if row is None:
+                print(f"Report #{report_id} not found.")
+            elif row[0] == "closed":
+                print(f"Report #{report_id} is already closed.")
+            else:
+                db.execute("UPDATE reports SET status = 'closed' WHERE id = ?", (report_id,))
+                db.commit()
+                print(f"Report #{report_id} closed.")
             return
         show_all = bool(args) and args[0] == "all"
         query = "SELECT id, created_at, reporter_name, reporter_uuid, target_name, target_uuid, avatar_hash, reason, status FROM reports"
